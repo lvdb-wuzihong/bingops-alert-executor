@@ -34,9 +34,12 @@ ENV TZ=Asia/Shanghai \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     ALERT_EXECUTOR_HEARTBEAT=/tmp/alert-executor-heartbeat
+# 文件日志：deployment 里自行注入 LOG_FILE 指向挂载卷路径（支持 {hostname} 占位符=Pod 名，
+# 多副本各写各的文件；RotatingFileHandler 50MB×5 自动轮转）；不注入则仅 stdout。
 
-# 非 root 运行；心跳文件目录授予写权限
-RUN useradd --system --create-home --shell /usr/sbin/nologin appuser \
+# 非 root 运行（固定 UID 10001，配合 deployment 的 fsGroup 保证 emptyDir 日志卷可写）；
+# 心跳与日志目录授予写权限
+RUN useradd --system --uid 10001 --create-home --shell /usr/sbin/nologin appuser \
     && mkdir -p /etc/alert-executor /tmp/alert-executor
 COPY --from=builder /install /usr/local
 RUN chown -R appuser:appuser /tmp/alert-executor

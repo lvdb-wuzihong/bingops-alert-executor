@@ -1,0 +1,53 @@
+# alert-executor 文件日志采集示例（vector）：tail LOG_FILE（deployment 里指向 emptyDir 卷）→ ClickHouse
+# 注意：emptyDir 随 Pod 销毁，若 vector 与执行器不在同一 Pod，无法直接 tail——可选：
+#   a) sidecar vector：在执行器 Pod 里加一个 vector 容器，挂同一 logs 卷，tail 后发送；
+#   b) 把 deployment 的 logs 卷换成 hostPath（+ initContainer chown 10001），本文件的
+#      include 路径即可被节点上的 vector DaemonSet 直接 tail；
+#   c) 或改用 vector 的 kubernetes_logs source 直接采容器 stdout（无需文件日志，
+#      此时删除 deployment 里的 LOG_FILE env 即可）。
+# 部署：重载 vector（vector validate 校验后 systemctl reload vector）。
+# 前置：执行器 deployment 已设 fsGroup: 10001 保证卷可写。
+
+[sources.executor_logs]
+type = "file"
+include = ["/var/log/alert-executor/executor-*.log"]
+# 多副本各写各的文件（executor-<pod名>.log），按文件名区分来源
+read_from = "beginning"
+fingerprint.strategy = "device_and_inode"
+ignore_older_secs = 86400        # 忽略超过 1 天未更新的旧轮转文件，避免重放
+
+# 解析执行器日志行："%Y-%m-%d %H:%M:%S,%f LEVEL name: message"
+[transforms.parse_executor]
+type = "remap"
+inputs = ["executor_logs"]
+source = '''
+line = string!(.message)
+parsed = parse_regex!(line, r'^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+) (?P<level>\w+)\s+(?P<logger>[\w.]+): (?P<message>[\s\S]*)$')
+.timestamp = parse_timestamp!(string!(parsed.ts), "%F %T,%3f")
+.level = parsed.level
+.logger = parsed.logger
+.message = parsed.message
+.host = get_hostname!()
+'''
+
+[sinks.clickhouse_executor]
+type = "clickhouse"
+inputs = ["parse_executor"]
+endpoint = "http://8.148.233.189:8123"       # 与数据源管理一致的 CH 地址
+database = "logs"
+table = "executor_logs"
+skip_unknown_fields = true
+auth.strategy = "basic"
+auth.user = "alert_ro"                        # 生产应换专用写入账号（有 INSERT 权限）
+auth.password = "${CH_WRITE_PASSWORD}"
+batch.max_events = 1000
+batch.timeout_secs = 5
+request.retry_max_attempts = 10
+
+# 目标表（在 CH 里执行一次）：
+# CREATE TABLE logs.executor_logs
+# (
+#     timestamp DateTime64(3), level String, logger String,
+#     message String, host String, file String, source_type String
+# )
+# ENGINE = MergeTree ORDER BY (timestamp, logger);

@@ -64,11 +64,17 @@ spec:
     spec:
       securityContext:
         runAsNonRoot: true
+        fsGroup: 10001                      # emptyDir 卷属组 = appuser(10001)，保证可写
       containers:
         - name: executor
           image: registry.internal/bingops/alert-executor:latest   # 替换为实际镜像仓库
           imagePullPolicy: IfNotPresent
           # 零入站端口：不声明 ports
+          # 文件日志：LOG_FILE 指向下方 logs 卷路径（{hostname}=Pod 名，多副本各写各的）；
+          # 不需要文件日志时删掉这个 env 即可（仅 stdout）
+          env:
+            - name: LOG_FILE
+              value: /var/log/alert-executor/executor-{hostname}.log
           envFrom:
             - secretRef:
                 name: alert-executor-secrets
@@ -79,6 +85,8 @@ spec:
             - name: config
               mountPath: /etc/alert-executor
               readOnly: true
+            - name: logs
+              mountPath: /var/log/alert-executor
           livenessProbe:
             exec:
               command:
@@ -103,4 +111,9 @@ spec:
         - name: config
           configMap:
             name: alert-executor-config
+        # 日志卷：emptyDir 随 Pod 生命周期；采集方式自选（sidecar vector 挂同一卷 /
+        # 定期 kubectl cp / 换 hostPath + initContainer chown 均可，改这里即可）
+        - name: logs
+          emptyDir:
+            sizeLimit: 512Mi
       terminationGracePeriodSeconds: 15
