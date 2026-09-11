@@ -1,6 +1,6 @@
 # bingops alert-executor 部署清单（设计文档 §12 运行形态）
 # 纪律对照：
-#   - 多副本无状态（2026-09-11 决策）：通知去重靠平台权威节流（firing repeat 30min /
+#   - 多副本无状态（2026-09-11 决策）：通知去重靠平台权威节流（firing：repeat notify 基于 DB updated_at；error：距同规则上一条 error ≥15min 才 notify=true）——DB 串行化保证并发回报时恰好一个副本拿到 notify=true 去发飞书。执行器本地限流仅作平台不可用时的兑底。仍不做分布式锁/Redis：代价是评估查询随副本数倍增（规则量大时按数据源静态归属分片，StatefulSet+ordinal 取模），for_rounds 防抖仍为各副本内存态（多副本下偏保守，宁漏勿误方向安全）。
 #     error 15min 节流，DB 串行化保证并发回报时恰好一个副本拿到 notify=true）；
 #     评估查询随副本数倍增，规则量大时改按数据源静态归属分片（StatefulSet+ordinal）
 #   - 零入站端口：探针走 exec 心跳文件检查，不声明任何 ports

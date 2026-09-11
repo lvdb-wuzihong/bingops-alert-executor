@@ -28,16 +28,20 @@ def _default_query_fn(host: str, port: int, secure: bool, database: str | None,
                       timeout_seconds: float) -> list[tuple]:
     import clickhouse_connect
 
-    client = clickhouse_connect.get_client(
-        host=host,
-        port=port,
-        secure=secure,
-        database=database,
-        username=username,
-        password=password,
-        connect_timeout=int(timeout_seconds),
-        send_receive_timeout=int(timeout_seconds),
-    )
+    kwargs: dict = {
+        "host": host,
+        "port": port,
+        "secure": secure,
+        "database": database,
+        "connect_timeout": int(timeout_seconds),
+        "send_receive_timeout": int(timeout_seconds),
+    }
+    # NO_AUTH（password=None）→ 完全匿名：不带任何 user/key 头。
+    # 实测 CH 26.x：匿名 = 免密 default 放行（与 vector 等采集器写入路径一致）；
+    # 显式 username=default + 空密码会被判「提供了错误凭据」而拒绝（code 194）。
+    if password is not None:
+        kwargs.update(username=username or "default", password=password)
+    client = clickhouse_connect.get_client(**kwargs)
     try:
         return client.query(sql).result_rows
     finally:
