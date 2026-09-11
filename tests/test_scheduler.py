@@ -186,7 +186,7 @@ async def test_report_failure_defaults_to_feishu():
 
 @pytest.mark.asyncio
 async def test_error_card_rate_limited_on_repeated_failures():
-    """持续评估失败：error 卡片每 15min 一张（本地限流），webhook error 回报照发。"""
+    """持续评估失败：平台 notify=true 时仍受本地限流兑底（每 15min 一张），回报照发。"""
     rule = make_rule()
     err = EvaluationResult.from_error(RuntimeError("ch down"))
     executor, evaluator, reporter, notifier, _ = make_executor(
@@ -196,6 +196,22 @@ async def test_error_card_rate_limited_on_repeated_failures():
         await one_tick(executor)
     assert notifier.errors == ["r1"]                       # error 卡片仅首张
     assert reporter.calls == [("r1", "error")] * 3          # error 回报照发
+    await executor._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_error_card_platform_throttle_suppresses():
+    """多副本权威判定：平台 error 节流返回 notify=false → 两个副本都不发橙卡，回报照发。"""
+    rule = make_rule()
+    err = EvaluationResult.from_error(RuntimeError("ch down"))
+    executor, evaluator, reporter, notifier, _ = make_executor(
+        [remote([rule])], {"r1": err},
+        reporter_response={"notify": False, "suppress_reason": "error notify throttled"})
+    rule.eval_interval_seconds = 0
+    for _ in range(3):
+        await one_tick(executor)
+    assert notifier.errors == []                           # 平台节流 → 不发
+    assert reporter.calls == [("r1", "error")] * 3
     await executor._client.aclose()
 
 

@@ -1,7 +1,8 @@
 # bingops alert-executor 部署清单（设计文档 §12 运行形态）
 # 纪律对照：
-#   - 单实例 Deployment + Recreate 策略：滚动更新会产生短暂双副本 → 双评估双发通知，
-#     必须 Recreate（先杀旧再起新）；多执行器分片属二期演进，契约不变
+#   - 多副本无状态（2026-09-11 决策）：通知去重靠平台权威节流（firing repeat 30min /
+#     error 15min 节流，DB 串行化保证并发回报时恰好一个副本拿到 notify=true）；
+#     评估查询随副本数倍增，规则量大时改按数据源静态归属分片（StatefulSet+ordinal）
 #   - 零入站端口：探针走 exec 心跳文件检查，不声明任何 ports
 #   - 凭据红线：token / webhook 地址 / 数据源密码全部 Secret env 注入（*_ref 的实际值）
 #   - executor 出口 IP 需在平台与各数据源侧加白（安全组源 IP 白名单，§12 部署边界）
@@ -52,9 +53,9 @@ metadata:
   namespace: bingops
   labels: {app: alert-executor}
 spec:
-  replicas: 1                                       # 单实例纪律
+  replicas: 2                                       # 多副本无状态：去重靠平台权威节流
   strategy:
-    type: Recreate                                  # 防滚动期间双实例双发
+    type: RollingUpdate                             # 双副本窗口由平台节流去重，Recreate 不再强制
   selector:
     matchLabels: {app: alert-executor}
   template:

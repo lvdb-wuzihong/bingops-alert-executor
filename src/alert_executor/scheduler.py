@@ -153,21 +153,24 @@ class AlertExecutor:
         if result.status == STATUS_ERROR:
             # 评估失败 = 状态未知：两路都走（§10）；平台收到 error 回报后
             # 顺延活跃 firing 的 last_seen_at（§12 二轮评审），本侧无需处理。
-            # error 卡片本地限流：持续失败每 15min 提醒一次，防每轮刷屏飞书；
-            # webhook 照报不受限流（平台统计/顺延推导窗口需要）。
+            # error 回报无条件发（平台统计/顺延推导窗口需要），响应携带平台节流后的 notify 决策。
             logger.warning("rule=%s 评估失败: %s", rule.code, result.error)
-            if self._limiter.allow(f"error:{rule.code}",
-                                   ERROR_NOTIFY_MIN_INTERVAL_SECONDS):
-                await self._notifier.send_error(rule, result.error)
-            else:
-                logger.warning(
-                    "rule=%s 评估持续失败（error 卡片 %ds 限流中），仅回报平台",
-                    rule.code, int(ERROR_NOTIFY_MIN_INTERVAL_SECONDS),
-                )
-            await self._reporter.report(
+            data = await self._reporter.report(
                 rule, REPORT_ERROR, 0, window_start, window_end,
                 details=None, error=result.error,
             )
+            # error 橙卡发送决策：平台指令制（多副本权威，DB 串行化保证并发回报时
+            # 恰好一个副本拿到 notify=true）+ 本地限流兑底（平台不可用 data=None 时
+            # 按主旁路纪律默认发，由本地 15min 限流防刷屏）。
+            platform_due = (data is None) or (data.get("notify") is True)
+            if platform_due and self._limiter.allow(
+                    f"error:{rule.code}", ERROR_NOTIFY_MIN_INTERVAL_SECONDS):
+                await self._notifier.send_error(rule, result.error)
+            else:
+                logger.info(
+                    "rule=%s error 卡片抑制（平台节流或本地限流中），仅回报平台",
+                    rule.code,
+                )
             return
 
         if not result.hit:
