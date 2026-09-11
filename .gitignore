@@ -1,0 +1,42 @@
+# ── Python 运行产物 ──────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# ── 测试与质量工具缓存 ───────────────────────────────────────────
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# ── 虚拟环境 ─────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+
+# ── 本地配置与凭据（红线：凭据只走 env，绝不入库） ──────────────
+config.yaml          # 本地 bootstrap 配置（含内网地址，模板用 config.example.yaml）
+.env
+.env.*
+*.pem
+*.key
+
+# ── 运行时产物 ───────────────────────────────────────────────────
+*.log
+alert-executor-heartbeat
+*.local.yaml
+
+# ── IDE / OS ─────────────────────────────────────────────────────
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+.qoder
+
+# 注意：deploy/、Dockerfile、docs/、config.example.yaml
+# 均需随仓库共享，不要加入忽略列表；.qoder/（本地开发技能）暂不入库。

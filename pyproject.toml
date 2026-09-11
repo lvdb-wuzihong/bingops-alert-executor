@@ -1,0 +1,32 @@
+[project]
+name = "alert-executor"
+version = "0.1.0"
+description = "BingOps 告警事件闭环执行器：双评估器（clickhouse SQL / PromQL）+ 飞书通知 + webhook 回报"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27",
+    "clickhouse-connect>=0.7",
+    "pydantic>=2.7",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "respx>=0.21",
+]
+
+[project.scripts]
+alert-executor = "alert_executor.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

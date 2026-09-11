@@ -1,0 +1,105 @@
+# bingops alert-executor 部署清单（设计文档 §12 运行形态）
+# 纪律对照：
+#   - 单实例 Deployment + Recreate 策略：滚动更新会产生短暂双副本 → 双评估双发通知，
+#     必须 Recreate（先杀旧再起新）；多执行器分片属二期演进，契约不变
+#   - 零入站端口：探针走 exec 心跳文件检查，不声明任何 ports
+#   - 凭据红线：token / webhook 地址 / 数据源密码全部 Secret env 注入（*_ref 的实际值）
+#   - executor 出口 IP 需在平台与各数据源侧加白（安全组源 IP 白名单，§12 部署边界）
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: bingops
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alert-executor-config
+  namespace: bingops
+  labels: {app: alert-executor}
+data:
+  config.yaml: |
+    platform:
+      base_url: http://bingops.bingops.svc:8000     # 平台服务地址（同 VPC 集群内）
+      token_ref: BINGOPS_AGENT_TOKEN                # env 解引用
+      timeout_seconds: 5
+      fetch_interval_seconds: 30
+    notify:
+      default_channel:
+        type: feishu-bot
+        secret_ref: FEISHU_WEBHOOK_URL              # env 值 = 完整 webhook 地址
+      dashboard_url: https://grafana.example.com
+    evaluation:
+      timeout_seconds: 10
+      per_source_concurrency: 16
+---
+# 凭据统一放 Secret（生产建议接外部 secret 管理；此处为最简形态）
+apiVersion: v1
+kind: Secret
+metadata:
+  name: alert-executor-secrets
+  namespace: bingops
+  labels: {app: alert-executor}
+stringData:
+  BINGOPS_AGENT_TOKEN: "REPLACE_ME"                 # 平台 agent 静态 token
+  FEISHU_WEBHOOK_URL: "REPLACE_ME"                  # 默认渠道飞书机器人完整地址
+  # 数据源密码：名字须与平台「数据源管理」里登记的 password_ref 一致（按需增删）
+  PROD_CH_READONLY: "REPLACE_ME"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alert-executor
+  namespace: bingops
+  labels: {app: alert-executor}
+spec:
+  replicas: 1                                       # 单实例纪律
+  strategy:
+    type: Recreate                                  # 防滚动期间双实例双发
+  selector:
+    matchLabels: {app: alert-executor}
+  template:
+    metadata:
+      labels: {app: alert-executor}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+      containers:
+        - name: executor
+          image: registry.internal/bingops/alert-executor:latest   # 替换为实际镜像仓库
+          imagePullPolicy: IfNotPresent
+          # 零入站端口：不声明 ports
+          envFrom:
+            - secretRef:
+                name: alert-executor-secrets
+          resources:
+            requests: {cpu: 50m, memory: 128Mi}
+            limits: {cpu: "1", memory: 512Mi}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/alert-executor
+              readOnly: true
+          livenessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - >-
+                  import os,time,sys; p=os.environ.get('ALERT_EXECUTOR_HEARTBEAT','/tmp/alert-executor-heartbeat');
+                  sys.exit(0 if os.path.exists(p) and time.time()-os.path.getmtime(p)<90 else 1)
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - >-
+                  import os,time,sys; p=os.environ.get('ALERT_EXECUTOR_HEARTBEAT','/tmp/alert-executor-heartbeat');
+                  sys.exit(0 if os.path.exists(p) and time.time()-os.path.getmtime(p)<90 else 1)
+            periodSeconds: 30
+      volumes:
+        - name: config
+          configMap:
+            name: alert-executor-config
+      terminationGracePeriodSeconds: 15

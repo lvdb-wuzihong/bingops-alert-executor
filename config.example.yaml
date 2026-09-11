@@ -1,0 +1,25 @@
+# alert-executor bootstrap 配置
+# 数据源 / 告警规则 / 通知渠道都在 bingops 平台侧配置，随分发体下发：
+#   GET {base_url}/api/v1/agent/config?version=<held>   （X-Agent-Token，版本协商，无变化返回空体）
+#   下发内容：data_sources（password_ref 引用名）+ notify_channels（secret_ref 引用名）
+#             + rules（评估契约 / 渠道绑定 / 卡片模板 / 静态 labels；未绑定数据源 = webhook-only 规则，执行器不评估）
+# 执行器基于环境变量读取实际值：password_ref / secret_ref 均为 env 变量名（缺失 fail fast），
+# 飞书真实 webhook 地址只存在于执行器 env（URL 即 secret，平台不落真地址），发送动作在执行器。
+# 本文件只存连接与默认渠道，不含规则/数据源/渠道清单。
+
+platform:
+  base_url: http://bingops.internal:8000
+  token_ref: BINGOPS_AGENT_TOKEN          # X-Agent-Token，env 解引用（fail fast）
+  timeout_seconds: 5
+  fetch_interval_seconds: 30              # 拉取节流；规则变更生效延迟 ≤ 一个周期
+
+notify:
+  # 执行器默认渠道：规则未绑定平台通知渠道时使用
+  default_channel:
+    type: feishu-bot
+    secret_ref: FEISHU_WEBHOOK_URL        # env 值 = 完整 webhook 地址
+  dashboard_url: https://grafana.example.com   # 卡片跳转兜底（规则未带 grafana_url 时）
+
+evaluation:
+  timeout_seconds: 10                     # 单条评估硬超时
+  per_source_concurrency: 16              # 按数据源分组限流（asyncio.Semaphore）
