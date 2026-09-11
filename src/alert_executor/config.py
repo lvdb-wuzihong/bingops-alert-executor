@@ -78,8 +78,9 @@ class DataSourceConfig(BaseModel):
     host: str | None = None
     port: int = 8443
     secure: bool = True
-    database: str = "default"
-    username: str = "alert_ro"
+    # None = 平台未填（UI 可选），连接时用 CH 服务器默认库
+    database: str | None = None
+    username: str | None = None  # 只读账号（可选）
     # victoria / prometheus
     url: HttpUrl | None = None
     # 凭据红线：只存引用名，运行时 resolve_credential 解引用

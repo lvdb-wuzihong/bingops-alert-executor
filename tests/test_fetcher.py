@@ -98,6 +98,17 @@ class TestParseRemote:
         assert remote.rules[0].notify_channel is None  # 通知由执行器默认处理
         assert remote.notify_channels == []
 
+    def test_optional_source_fields_null(self):
+        """平台 UI 的 database/username 为可选：下发 null 时不应导致规则被跳过。"""
+        body = platform_body()
+        body["rules"][0]["datasource"] = dict(
+            PLATFORM_RULE["datasource"], database_name=None, username=None,
+        )
+        remote = parse_remote(body)
+        assert len(remote.rules) == 1
+        assert remote.data_sources[0].database is None
+        assert remote.data_sources[0].username is None
+
     def test_missing_datasource_skipped(self):
         rule_item = dict(PLATFORM_RULE, datasource=None)
         remote = parse_remote(platform_body(rules=[rule_item]))
