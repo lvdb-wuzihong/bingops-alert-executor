@@ -18,12 +18,13 @@ logger = logging.getLogger(__name__)
 WINDOW_PLACEHOLDER = "{window_minutes}"
 
 # 生产查询实现：clickhouse-connect 同步客户端放到线程执行。
-# password=None（NO_AUTH）时不带认证参数；timeout 秒级硬超时。
+# password=None（NO_AUTH）时不带认证参数；timeout 秒级硬超时（连接+读写），
+# 评估器外层另有 asyncio.wait_for 二次兜底。
 QueryFn = Callable[[str, str, str | None, float], list[tuple]]
 
 
-def _default_query_fn(host: str, port: int, secure: bool, database: str,
-                      username: str, sql: str, password: str | None,
+def _default_query_fn(host: str, port: int, secure: bool, database: str | None,
+                      username: str | None, sql: str, password: str | None,
                       timeout_seconds: float) -> list[tuple]:
     import clickhouse_connect
 
@@ -34,7 +35,8 @@ def _default_query_fn(host: str, port: int, secure: bool, database: str,
         database=database,
         username=username,
         password=password,
-        query_timeout=int(timeout_seconds),
+        connect_timeout=int(timeout_seconds),
+        send_receive_timeout=int(timeout_seconds),
     )
     try:
         return client.query(sql).result_rows
