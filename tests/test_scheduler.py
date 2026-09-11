@@ -28,12 +28,14 @@ class FakeEvaluator:
 
 
 class SpyReporter:
-    def __init__(self) -> None:
+    def __init__(self, response: dict | None = None) -> None:
+        # response=None 模拟回报失败（data=None → 主旁路默认发飞书）
+        self.response = {"notify": True, "event_id": 1} if response is None else response
         self.calls: list[tuple[str, str]] = []
 
     async def report(self, rule, status, total, ws, we, details, error=None):
         self.calls.append((rule.code, status))
-        return {"notify": True, "event_id": 1}
+        return self.response
 
 
 class SpyNotifier:
@@ -82,11 +84,12 @@ def remote(rules, sources=None, version: str = "v1") -> RemoteConfig:
 
 def make_executor(script: list[RemoteConfig | None],
                   results: dict[str, EvaluationResult] | None = None,
+                  reporter_response: dict | None = None,
                   ) -> tuple[AlertExecutor, FakeEvaluator, SpyReporter, SpyNotifier,
                              FakeFetcher]:
     executor = AlertExecutor(make_cfg(), client=httpx.AsyncClient())
     evaluator = FakeEvaluator(results or {})
-    reporter, notifier = SpyReporter(), SpyNotifier()
+    reporter, notifier = SpyReporter(reporter_response), SpyNotifier()
     fetcher = FakeFetcher(script)
     executor._evaluators = {"clickhouse": evaluator}
     executor._reporter = reporter
@@ -155,6 +158,44 @@ async def test_notify_disabled_skips_feishu_keeps_webhook():
     await one_tick(executor)
     assert notifier.alerts == []
     assert reporter.calls == [("r1", "firing")]
+    await executor._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_platform_notify_false_suppresses_feishu():
+    """平台 repeat notify 协议：notify=false（活跃 firing 30min 内重复）→ 跳过飞书，webhook 照报。"""
+    executor, evaluator, reporter, notifier, _ = make_executor(
+        [remote([make_rule()])], {"r1": HIT},
+        reporter_response={"notify": False, "suppress_reason": "firing ongoing"})
+    await one_tick(executor)
+    assert reporter.calls == [("r1", "firing")]  # webhook 照报
+    assert notifier.alerts == []                 # 平台抑制 → 飞书不发
+    await executor._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_report_failure_defaults_to_feishu():
+    """回报失败（data=None）→ 默认发飞书：主旁路纪律，宁多勿漏。"""
+    executor, evaluator, reporter, notifier, _ = make_executor(
+        [remote([make_rule()])], {"r1": HIT}, reporter_response=None)
+    await one_tick(executor)
+    assert reporter.calls == [("r1", "firing")]
+    assert notifier.alerts == ["r1"]
+    await executor._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_error_card_rate_limited_on_repeated_failures():
+    """持续评估失败：error 卡片每 15min 一张（本地限流），webhook error 回报照发。"""
+    rule = make_rule()
+    err = EvaluationResult.from_error(RuntimeError("ch down"))
+    executor, evaluator, reporter, notifier, _ = make_executor(
+        [remote([rule])], {"r1": err})
+    rule.eval_interval_seconds = 0
+    for _ in range(3):
+        await one_tick(executor)
+    assert notifier.errors == ["r1"]                       # error 卡片仅首张
+    assert reporter.calls == [("r1", "error")] * 3          # error 回报照发
     await executor._client.aclose()
 
 

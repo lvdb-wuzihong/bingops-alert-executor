@@ -36,6 +36,11 @@ TICK_SECONDS = 1.0
 HEARTBEAT_PATH = os.environ.get("ALERT_EXECUTOR_HEARTBEAT", "/tmp/alert-executor-heartbeat")
 # 心跳最大陈旧秒数：超过即视为不健康（> tick 周期的数量级即可）
 HEARTBEAT_MAX_AGE_SECONDS = 90
+# error 卡片最小发送间隔（秒）：持续评估失败时防刷屏（§12 退化 RateLimiter 同款语义）。
+# error 回报不受限流（平台统计需要），只限飞书；env 可调（联调期可临时调小）。
+ERROR_NOTIFY_MIN_INTERVAL_SECONDS = float(
+    os.environ.get("ALERT_EXECUTOR_ERROR_NOTIFY_INTERVAL_SECONDS", "900"),
+)
 
 
 class AlertExecutor:
@@ -148,8 +153,17 @@ class AlertExecutor:
         if result.status == STATUS_ERROR:
             # 评估失败 = 状态未知：两路都走（§10）；平台收到 error 回报后
             # 顺延活跃 firing 的 last_seen_at（§12 二轮评审），本侧无需处理。
+            # error 卡片本地限流：持续失败每 15min 提醒一次，防每轮刷屏飞书；
+            # webhook 照报不受限流（平台统计/顺延推导窗口需要）。
             logger.warning("rule=%s 评估失败: %s", rule.code, result.error)
-            await self._notifier.send_error(rule, result.error)
+            if self._limiter.allow(f"error:{rule.code}",
+                                   ERROR_NOTIFY_MIN_INTERVAL_SECONDS):
+                await self._notifier.send_error(rule, result.error)
+            else:
+                logger.warning(
+                    "rule=%s 评估持续失败（error 卡片 %ds 限流中），仅回报平台",
+                    rule.code, int(ERROR_NOTIFY_MIN_INTERVAL_SECONDS),
+                )
             await self._reporter.report(
                 rule, REPORT_ERROR, 0, window_start, window_end,
                 details=None, error=result.error,
@@ -166,19 +180,24 @@ class AlertExecutor:
                          rule.code, self._debounce.hits(rule.code), rule.for_rounds)
             return
 
-        # 飞书主路：notify_enabled=false（平台「仅记录」）只回报不发飞书；
-        # per-rule 最小发送间隔防刷屏；限流只拦飞书，webhook 照报（at-least-once）
-        if not rule.notify_enabled:
-            logger.info("rule=%s notify_enabled=false，跳过飞书（webhook 照报）", rule.code)
-        elif self._limiter.allow(rule.code, rule.notify_interval_minutes * 60):
-            await self._notifier.send_alert(rule, result, window_start, window_end)
-        else:
-            logger.info("rule=%s 飞书限流跳过本轮（webhook 照报）", rule.code)
-
+        # 先回报拿平台决策，再发飞书：平台 repeat notify 协议（§4.2）——
+        # 活跃 firing 30min 内重复回报返回 notify=false，由平台抑制重发（防每轮刷屏）；
+        # 回报失败 / 响应缺失 / notify=true / notify 字段缺失 → 默认发（主旁路纪律：宁多勿漏）
         data = await self._reporter.report(
             rule, REPORT_FIRING, result.total_count,
             window_start, window_end, result.details,
         )
-        # 一期不读 notify 响应字段（行为不变）；二期转正后据 data.notify 决定是否发飞书
-        if data is not None:
-            logger.debug("rule=%s 平台受理 data=%s", rule.code, data)
+
+        if not rule.notify_enabled:
+            logger.info("rule=%s notify_enabled=false，跳过飞书（webhook 照报）", rule.code)
+            return
+        if data is not None and data.get("notify") is False:
+            logger.info(
+                "rule=%s 平台通知抑制（活跃 firing repeat 窗口内，%s），跳过飞书",
+                rule.code, data.get("suppress_reason"),
+            )
+            return
+        if not self._limiter.allow(rule.code, rule.notify_interval_minutes * 60):
+            logger.info("rule=%s 本地飞书限流跳过本轮（webhook 照报）", rule.code)
+            return
+        await self._notifier.send_alert(rule, result, window_start, window_end)
