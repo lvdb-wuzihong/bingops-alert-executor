@@ -151,12 +151,12 @@ async def test_hot_reload_add_and_remove_rules():
 
 
 @pytest.mark.asyncio
-async def test_notify_disabled_skips_feishu_keeps_webhook():
-    """平台「仅记录」（notify_enabled=false）：不发飞书，webhook 照报。"""
+async def test_notify_enabled_decoupled_from_notification():
+    """通知与开单解耦：notify_enabled（仅记录/不开单）不影响飞书通知。"""
     executor, evaluator, reporter, notifier, _ = make_executor(
         [remote([make_rule(notify_enabled=False)])], {"r1": HIT})
     await one_tick(executor)
-    assert notifier.alerts == []
+    assert notifier.alerts == ["r1"]                 # 通知照发（依据=渠道绑定，与开单解耦）
     assert reporter.calls == [("r1", "firing")]
     await executor._client.aclose()
 

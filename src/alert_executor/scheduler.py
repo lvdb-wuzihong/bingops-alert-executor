@@ -191,9 +191,8 @@ class AlertExecutor:
             window_start, window_end, result.details,
         )
 
-        if not rule.notify_enabled:
-            logger.info("rule=%s notify_enabled=false，跳过飞书（webhook 照报）", rule.code)
-            return
+        # 通知与开单解耦（2026-09-11）：notify_enabled 是平台侧工单联动开关，
+        # 执行器不消费；通知依据 = 绑定渠道 → 默认渠道。
         if data is not None and data.get("notify") is False:
             logger.info(
                 "rule=%s 平台通知抑制（活跃 firing repeat 窗口内，%s），跳过飞书",

@@ -130,8 +130,8 @@ class RuleConfig(BaseModel):
     grafana_url: str | None = None
     # 飞书卡片模板 JSON，随分发体下发，执行器自行渲染发送
     card_template: dict[str, Any] | None = None
-    # 平台「仅记录」开关：False 时只评估回报 webhook，不发飞书
-    notify_enabled: bool = True
+    # notify_enabled（平台「自动开单/仅记录」）不下发消费：它是平台侧工单联动开关，
+    # 与通知无关；执行器通知依据 = 渠道绑定（notify_channel）→ 默认渠道
     enabled: bool = True
 
 
