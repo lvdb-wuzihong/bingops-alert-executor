@@ -24,10 +24,10 @@ from .config import AppConfig, DataSourceConfig, RuleConfig
 from .evaluators import build_evaluators
 from .fetcher import AgentConfigFetcher, RemoteConfig
 from .feishu import FeishuNotifier
-from .lease import RedisLeaseCoordinator
+from .lease import RedisLeaseCoordinator, SharedRateLimiter
 from .models import REPORT_ERROR, REPORT_FIRING, STATUS_ERROR, EvaluationResult
 from .reporter import PlatformReporter, current_window
-from .state import Debounce, RateLimiter
+from .state import Debounce
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +42,8 @@ HEARTBEAT_MAX_AGE_SECONDS = 90
 ERROR_NOTIFY_MIN_INTERVAL_SECONDS = float(
     os.environ.get("ALERT_EXECUTOR_ERROR_NOTIFY_INTERVAL_SECONDS", "60"),
 )
+# 飞书发卡最小窗口（秒）：同分钟去重的口径；env 可调。实际窗口 = max(此值, 规则 notify_interval_minutes)。
+NOTIFY_WINDOW_SECONDS = float(os.environ.get("NOTIFY_WINDOW_SECONDS", "60"))
 
 # ── 多副本协调（2026-09-13 用户决策：Redis 租约，见 lease.py） ──────────────────
 # REDIS_URL 注入即启用：每条规则同一时刻恰好一个实例评估（Deployment 任意扩缩容）；
@@ -60,7 +62,8 @@ class AlertExecutor:
         self._evaluators = build_evaluators(self._client, cfg.evaluation)
         self._fetcher = fetcher or AgentConfigFetcher(self._client, cfg.platform)
         self._debounce = Debounce()
-        self._limiter = RateLimiter()
+        # 共享通知限流：REDIS_URL 有值时跨副本共享窗口；无值/Redis 挂时内部降级本地
+        self._gate = SharedRateLimiter(url=os.environ.get("REDIS_URL"))
         # 运行时配置状态：初始为空，由首轮拉取填充（拉不到则空转等待平台）
         self._config_version: str | None = None
         self._last_fetch = 0.0
@@ -180,24 +183,18 @@ class AlertExecutor:
         if result.status == STATUS_ERROR:
             # 评估失败 = 状态未知：两路都走（§10）；平台收到 error 回报后
             # 顺延活跃 firing 的 last_seen_at（§12 二轮评审），本侧无需处理。
-            # error 回报无条件发（平台统计/顺延推导窗口需要），响应携带平台节流后的 notify 决策。
+            # error 回报无条件发（平台统计/顺延推导窗口需要）；响应携带平台 notify（恒 true）。
+            # 橙卡发送节奏由共享限流门控统一控制（ERROR_NOTIFY_MIN_INTERVAL_SECONDS）。
             logger.warning("rule=%s 评估失败: %s", rule.code, result.error)
             data = await self._reporter.report(
                 rule, REPORT_ERROR, 0, window_start, window_end,
                 details=None, error=result.error,
             )
-            # error 橙卡发送决策：平台指令制（多副本权威，DB 串行化保证并发回报时
-            # 恰好一个副本拿到 notify=true）+ 本地限流兑底（平台不可用 data=None 时
-            # 按主旁路纪律默认发，由本地 15min 限流防刷屏）。
-            platform_due = (data is None) or (data.get("notify") is True)
-            if platform_due and self._limiter.allow(
-                    f"error:{rule.code}", ERROR_NOTIFY_MIN_INTERVAL_SECONDS):
+            if await self._gate.allow(f"error:{rule.code}",
+                                      ERROR_NOTIFY_MIN_INTERVAL_SECONDS):
                 await self._notifier.send_error(rule, result.error)
             else:
-                logger.info(
-                    "rule=%s error 卡片抑制（平台节流或本地限流中），仅回报平台",
-                    rule.code,
-                )
+                logger.info("rule=%s error 卡片共享限流窗口内，仅回报平台", rule.code)
             return
 
         if not result.hit:
@@ -211,22 +208,23 @@ class AlertExecutor:
             return
 
         # 先回报拿平台决策，再发飞书：平台 repeat notify 协议（§4.2）——
-        # 活跃 firing 30min 内重复回报返回 notify=false，由平台抑制重发（防每轮刷屏）；
-        # 回报失败 / 响应缺失 / notify=true / notify 字段缺失 → 默认发（主旁路纪律：宁多勿漏）
+        # 活跃 firing 重复回报在 repeat 窗口内返回 notify=false（metric 类）；
+        # 流水型（recorded/error）平台恒 notify=true，去重由下方共享限流门控负责。
+        # 回报失败 / 响应缺失 / notify=true / 字段缺失 → 走门控（默认发，主旁路纪律）。
         data = await self._reporter.report(
             rule, REPORT_FIRING, result.total_count,
             window_start, window_end, result.details,
         )
 
-        # 通知与开单解耦（2026-09-11）：notify_enabled 是平台侧工单联动开关，
-        # 执行器不消费；通知依据 = 绑定渠道 → 默认渠道。
         if data is not None and data.get("notify") is False:
             logger.info(
                 "rule=%s 平台通知抑制（活跃 firing repeat 窗口内，%s），跳过飞书",
                 rule.code, data.get("suppress_reason"),
             )
             return
-        if not self._limiter.allow(rule.code, rule.notify_interval_minutes * 60):
-            logger.info("rule=%s 本地飞书限流跳过本轮（webhook 照报）", rule.code)
+        # 共享限流门控：同分钟内多副本只发一张；窗口=max(60s, 规则 notify_interval_minutes)
+        window = max(NOTIFY_WINDOW_SECONDS, rule.notify_interval_minutes * 60)
+        if not await self._gate.allow(f"notify:{rule.code}", window):
+            logger.info("rule=%s 共享限流窗口内（%ds），跳过飞书", rule.code, int(window))
             return
         await self._notifier.send_alert(rule, result, window_start, window_end)

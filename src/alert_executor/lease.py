@@ -20,9 +20,12 @@ import uuid
 import redis.asyncio as aioredis
 from redis.exceptions import RedisError
 
+from .state import RateLimiter
+
 logger = logging.getLogger(__name__)
 
 LEASE_PREFIX = "alert-executor:lease:"
+NOTIFY_PREFIX = "alert-executor:notify:"
 
 
 class RedisLeaseCoordinator:
@@ -57,4 +60,35 @@ class RedisLeaseCoordinator:
             pass
 
 
-__all__ = ["RedisLeaseCoordinator"]
+class SharedRateLimiter:
+    """跨副本共享的通知限流（多副本去重的执行器侧实现）。
+
+    平台对流水型事件（recorded/error）每轮回 notify=true，若每个副本各自用
+    本地内存限流，N 副本 = N 张卡。本类把「上次发卡」窗口键放进 Redis，
+    两副本共享同一状态：同窗口内只有第一个到的副本发卡。
+    Redis 不可用 → 降级本地内存限流（单副本语义，多副本下临时回到 N 倍）。
+    """
+
+    def __init__(self, url: str | None = None,
+                 client: "aioredis.Redis | None" = None,
+                 local: RateLimiter | None = None) -> None:
+        self._redis = (client if client is not None
+                       else (aioredis.from_url(url, decode_responses=True)
+                             if url else None))
+        self._local = local or RateLimiter()
+
+    async def allow(self, key: str, window_seconds: float) -> bool:
+        """同 key 在 window_seconds 内只放行一次（跨副本共享）。"""
+        window_ms = int(window_seconds * 1000)
+        if self._redis is not None:
+            try:
+                acquired = await self._redis.set(
+                    NOTIFY_PREFIX + key, "1", nx=True, px=window_ms)
+                return bool(acquired)
+            except RedisError as e:
+                logger.warning("Redis 共享限流不可用，降级本地限流: %s", e)
+                self._redis = None  # 降级为本地，避免每轮重复报错
+        return self._local.allow(key, window_seconds)
+
+
+__all__ = ["RedisLeaseCoordinator", "SharedRateLimiter"]

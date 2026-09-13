@@ -200,18 +200,18 @@ async def test_error_card_rate_limited_on_repeated_failures():
 
 
 @pytest.mark.asyncio
-async def test_error_card_platform_throttle_suppresses():
-    """多副本权威判定：平台 error 节流返回 notify=false → 两个副本都不发橙卡，回报照发。"""
+async def test_error_card_gate_controls_rate():
+    """error 橙卡由共享门控节流（平台 notify 已回退为恒 true，去重归执行器门控）。"""
     rule = make_rule()
     err = EvaluationResult.from_error(RuntimeError("ch down"))
     executor, evaluator, reporter, notifier, _ = make_executor(
         [remote([rule])], {"r1": err},
-        reporter_response={"notify": False, "suppress_reason": "error notify throttled"})
+        reporter_response={"notify": True})
     rule.eval_interval_seconds = 0
     for _ in range(3):
         await one_tick(executor)
-    assert notifier.errors == []                           # 平台节流 → 不发
-    assert reporter.calls == [("r1", "error")] * 3
+    assert notifier.errors == ["r1"]                       # 门控 60s 窗口内仅首张
+    assert reporter.calls == [("r1", "error")] * 3          # error 回报照发
     await executor._client.aclose()
 
 
