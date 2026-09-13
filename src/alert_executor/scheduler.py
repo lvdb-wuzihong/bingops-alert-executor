@@ -24,6 +24,7 @@ from .config import AppConfig, DataSourceConfig, RuleConfig
 from .evaluators import build_evaluators
 from .fetcher import AgentConfigFetcher, RemoteConfig
 from .feishu import FeishuNotifier
+from .lease import RedisLeaseCoordinator
 from .models import REPORT_ERROR, REPORT_FIRING, STATUS_ERROR, EvaluationResult
 from .reporter import PlatformReporter, current_window
 from .state import Debounce, RateLimiter
@@ -42,10 +43,15 @@ ERROR_NOTIFY_MIN_INTERVAL_SECONDS = float(
     os.environ.get("ALERT_EXECUTOR_ERROR_NOTIFY_INTERVAL_SECONDS", "900"),
 )
 
+# ── 多副本协调（2026-09-13 用户决策：Redis 租约，见 lease.py） ──────────────────
+# REDIS_URL 注入即启用：每条规则同一时刻恰好一个实例评估（Deployment 任意扩缩容）；
+# 未注入 → 全量评估（单副本兼容）；Redis 不可用 → fail-open（宁多勿漏，平台兜底）。
+
 
 class AlertExecutor:
     def __init__(self, cfg: AppConfig, client: httpx.AsyncClient | None = None,
-                 fetcher: AgentConfigFetcher | None = None) -> None:
+                 fetcher: AgentConfigFetcher | None = None,
+                 coordinator: RedisLeaseCoordinator | None = None) -> None:
         self._cfg = cfg
         self._client = client or httpx.AsyncClient(follow_redirects=True)
         self._owns_client = client is None
@@ -63,10 +69,22 @@ class AlertExecutor:
         self._sems: dict[str, asyncio.Semaphore] = {}
         self._in_flight: set[str] = set()
         self._next_due: dict[str, float] = {}
+        # 多副本协调（2026-09-13 用户决策：Redis 租约）：REDIS_URL 注入即启用——
+        # 每条规则同一时刻恰好一个实例评估（Deployment 任意扩缩容）；
+        # 未注入 → 全量评估（单副本兼容）；Redis 不可用 → fail-open（宁多勿漏）。
+        redis_url = os.environ.get("REDIS_URL")
+        self._coordinator: RedisLeaseCoordinator | None = (
+            coordinator if coordinator is not None
+            else (RedisLeaseCoordinator(redis_url) if redis_url else None)
+        )
 
     async def run(self) -> None:
-        logger.info("alert-executor 启动：平台 %s（规则走平台拉取，版本协商）",
-                    self._cfg.platform.base_url)
+        if self._coordinator is not None:
+            logger.info("alert-executor 启动：平台 %s（多副本 Redis 租约协调）",
+                        self._cfg.platform.base_url)
+        else:
+            logger.info("alert-executor 启动：平台 %s（未启用协调，全量评估）",
+                        self._cfg.platform.base_url)
         try:
             while True:
                 await self._tick()
@@ -131,6 +149,15 @@ class AlertExecutor:
     async def _evaluate(self, rule: RuleConfig) -> None:
         self._in_flight.add(rule.code)
         try:
+            # 多副本租约：抢不到说明其他实例存活并持有该规则，跳过（下轮再竞争）；
+            # TTL = max(60s, 2×评估间隔)，实例死亡后租约到期自动被接管；
+            # Redis 不可用 → fail-open 全量评估（宁多勿漏，平台幂等+节流兜底）。
+            if self._coordinator is not None:
+                lease_ttl = max(60.0, 2 * rule.eval_interval_seconds)
+                if not await self._coordinator.acquire(
+                        f"{rule.source}/{rule.code}", lease_ttl):
+                    logger.debug("rule=%s 租约归其他实例，跳过本轮", rule.code)
+                    return
             source = self._sources[rule.data_source]
             evaluator = self._evaluators[source.type]
             # 配置热替换竞态防御：数据源被删时兜底新建信号量，不让单条规则拖垮循环

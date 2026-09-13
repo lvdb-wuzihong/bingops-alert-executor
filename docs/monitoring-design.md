@@ -135,7 +135,7 @@ CREATE TABLE alert_events (
     source         VARCHAR(32)  NOT NULL,
     rule_code      VARCHAR(128) NOT NULL,
     rule_name      VARCHAR(255),
-    status         VARCHAR(16)  NOT NULL,              -- firing | resolved | error
+    status         VARCHAR(16)  NOT NULL,              -- firing | resolved | error | recorded(日志事件流水)
     window_start   TIMESTAMPTZ,
     window_end     TIMESTAMPTZ,
     first_seen_at  TIMESTAMPTZ  NOT NULL DEFAULT now(),
@@ -216,6 +216,7 @@ error 回报 → 独立落行（status='error'），不进状态机、不开单�
 - `GET /api/v1/alerts/events?status=&source=&rule_code=&since=&until=` 分页列表
 - `GET /api/v1/alerts/stats/summary?since=&until=&group_by=source|rule_code|group_id|day`
   - 各 status 事件数、当前活跃 firing 数、平均恢复时长 `avg(resolved_at - first_seen_at)`
+  - 顶层另含日志类汇总：`recorded_total` / `error_total` / `recorded_error_total`（日志告警不进 firing→resolved 闭环，看板卡片需单独口径，与生命周期卡片分开展示）
 - 高频 firing 规则排名即噪声规则治理清单。权限码按 RBAC 规范注册（建议 `alert:read` / `alert:manage`）。
 
 ## 10. ck-log-alert 适配清单（约 +30 行）
@@ -281,6 +282,8 @@ def report_event(cfg: dict, rule: dict, status: str, total: int,
 - **运行形态**：Deployment 单副本 + 进程内节拍循环（每轮：拉配置 → 评估到期规则 → 回报），优于 CronJob（无每分钟 Pod 冷启动）；进程内循环属执行器本职，不违反「评估循环不进 bingops 主进程」约束；重叠保护用进程内 flock；**规则级扫描间隔 `eval_interval_seconds`（秒，默认 60）由执行器本地调度（next_due = last_eval + interval），与查询窗口 `interval_minutes` 独立**；
 
 **规则字段语义表（两类规则的字段职责，录入时对照）**：
+
+**双模型（2026-09-11 定稿）**：`metric` 指标规则 = **状态机**（firing 合并续命 → resolved/stale，有活跃/恢复/MTTR 语义）；`log` 日志规则 = **事件流水**（每轮命中记一条 status=`recorded`，无状态、不合并、无恢复概念，带次数与明细；执行器仍报 firing，平台按 rule_kind 转译）。工单开单联动仅 metric firing（log 逐条开单会淹没工单系统）；飞书通知 log 每轮直发（RateLimiter 以 notify_interval_minutes 兜底）。统计双看板：指标看板读 firing/resolved/MTTR，日志看板读 recorded_count/recorded_error_total 时间序列。
 
 | 字段 | CH 日志规则 | VM 指标规则 |
 |---|---|---|

@@ -8,6 +8,7 @@ dependencies = [
     "clickhouse-connect>=0.7",
     "pydantic>=2.7",
     "PyYAML>=6.0",
+    "redis>=5.0",
 ]
 
 [project.optional-dependencies]
