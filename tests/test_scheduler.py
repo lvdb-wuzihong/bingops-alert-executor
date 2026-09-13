@@ -250,13 +250,14 @@ async def test_for_rounds_debounce_gate():
 
 
 @pytest.mark.asyncio
-async def test_rate_limit_blocks_feishu_not_webhook():
+async def test_firing_streams_every_round_without_gate():
+    """recorded 流水：firing 每轮直发不限流（单份由 Redis 租约保证），节奏=评估间隔。"""
     executor, evaluator, reporter, notifier, _ = make_executor(
         [remote([make_rule(notify_interval_minutes=60)])], {"r1": HIT})
     await one_tick(executor)
     await one_tick(executor)
     assert reporter.calls == [("r1", "firing"), ("r1", "firing")]  # webhook 照报
-    assert notifier.alerts == ["r1"]                               # 飞书被限流
+    assert notifier.alerts == ["r1", "r1"]                         # 飞书每轮直发
     await executor._client.aclose()
 
 

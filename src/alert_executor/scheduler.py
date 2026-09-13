@@ -37,13 +37,12 @@ TICK_SECONDS = 1.0
 HEARTBEAT_PATH = os.environ.get("ALERT_EXECUTOR_HEARTBEAT", "/tmp/alert-executor-heartbeat")
 # 心跳最大陈旧秒数：超过即视为不健康（> tick 周期的数量级即可）
 HEARTBEAT_MAX_AGE_SECONDS = 90
-# error 卡片最小发送间隔（秒）：同分钟内多副本去重；跨分钟照常提醒（1min 对齐平台口径）。
-# error 回报不受限流（平台统计需要），只限飞书；env 可调。
+# error 卡片最小发送间隔（秒）：防评估失败风暴刷屏（失败是异常态，非流水）；env 可调。
+# firing（recorded 流水）不限流：Redis 租约已保证每条规则单实例评估，
+# 每轮命中直发一张即单份提醒，节奏跟随规则评估间隔。
 ERROR_NOTIFY_MIN_INTERVAL_SECONDS = float(
     os.environ.get("ALERT_EXECUTOR_ERROR_NOTIFY_INTERVAL_SECONDS", "60"),
 )
-# 飞书发卡最小窗口（秒）：同分钟去重的口径；env 可调。实际窗口 = max(此值, 规则 notify_interval_minutes)。
-NOTIFY_WINDOW_SECONDS = float(os.environ.get("NOTIFY_WINDOW_SECONDS", "60"))
 
 # ── 多副本协调（2026-09-13 用户决策：Redis 租约，见 lease.py） ──────────────────
 # REDIS_URL 注入即启用：每条规则同一时刻恰好一个实例评估（Deployment 任意扩缩容）；
@@ -216,15 +215,14 @@ class AlertExecutor:
             window_start, window_end, result.details,
         )
 
+        # 通知与开单解耦（2026-09-11）：notify_enabled 是平台侧工单联动开关，不消费。
+        # firing（recorded 流水）每轮直发：Redis 租约已保证单实例评估（单份来源），
+        # 流水告警的提醒节奏 = 规则评估间隔，不限流；
+        # 仅 metric 类的平台 repeat 抑制（notify=false）生效。
         if data is not None and data.get("notify") is False:
             logger.info(
                 "rule=%s 平台通知抑制（活跃 firing repeat 窗口内，%s），跳过飞书",
                 rule.code, data.get("suppress_reason"),
             )
-            return
-        # 共享限流门控：同分钟内多副本只发一张；窗口=max(60s, 规则 notify_interval_minutes)
-        window = max(NOTIFY_WINDOW_SECONDS, rule.notify_interval_minutes * 60)
-        if not await self._gate.allow(f"notify:{rule.code}", window):
-            logger.info("rule=%s 共享限流窗口内（%ds），跳过飞书", rule.code, int(window))
             return
         await self._notifier.send_alert(rule, result, window_start, window_end)
