@@ -37,10 +37,10 @@ TICK_SECONDS = 1.0
 HEARTBEAT_PATH = os.environ.get("ALERT_EXECUTOR_HEARTBEAT", "/tmp/alert-executor-heartbeat")
 # 心跳最大陈旧秒数：超过即视为不健康（> tick 周期的数量级即可）
 HEARTBEAT_MAX_AGE_SECONDS = 90
-# error 卡片最小发送间隔（秒）：持续评估失败时防刷屏（§12 退化 RateLimiter 同款语义）。
-# error 回报不受限流（平台统计需要），只限飞书；env 可调（联调期可临时调小）。
+# error 卡片最小发送间隔（秒）：同分钟内多副本去重；跨分钟照常提醒（1min 对齐平台口径）。
+# error 回报不受限流（平台统计需要），只限飞书；env 可调。
 ERROR_NOTIFY_MIN_INTERVAL_SECONDS = float(
-    os.environ.get("ALERT_EXECUTOR_ERROR_NOTIFY_INTERVAL_SECONDS", "900"),
+    os.environ.get("ALERT_EXECUTOR_ERROR_NOTIFY_INTERVAL_SECONDS", "60"),
 )
 
 # ── 多副本协调（2026-09-13 用户决策：Redis 租约，见 lease.py） ──────────────────
