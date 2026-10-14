@@ -183,7 +183,7 @@ class FeishuNotifier:
     async def send_alert(self, rule: Any, result: Any,
                          window_start: datetime, window_end: datetime,
                          event_id: int | None = None) -> None:
-        """firing 告警：优先规则卡片模板，否则内置夜莺对齐红色卡片。"""
+        """firing 告警（CH 文本/合并形态）：优先规则卡片模板，否则内置夜莺对齐红色卡片。"""
         try:
             target = self._resolve(rule)
         except RuntimeError as e:  # 凭据 env 缺失（fail fast 语义）
@@ -205,6 +205,52 @@ class FeishuNotifier:
             lines += ["", _format_details(result.details)]
             buttons = self._buttons(event_id, target.grafana_url)
             body = build_card(f"[告警] {rule.name}", "red", lines, buttons)
+        await self._post(rule, target.webhook_url, body)
+
+    async def send_alert_series(self, rule: Any, sample: dict,
+                                window_start: datetime, window_end: datetime,
+                                event_id: int | None = None) -> None:
+        """单序列告警卡（PromQL 多序列拆分）：序列 labels 平铺 + 触发值加粗。
+
+        多序列拆分的价值：每条序列独立生命周期——独立触发值、独立恢复通知。
+        """
+        try:
+            target = self._resolve(rule)
+        except RuntimeError as e:
+            logger.error("rule=%s 飞书渠道凭据解析失败: %s", rule.code, e)
+            return
+        metric = sample.get("metric") or {}
+        labels_line = "　".join(f"{k}={v}" for k, v in metric.items())
+        severity = _SEVERITY_LABELS.get(rule.severity, str(rule.severity))
+        lines = [
+            f"**规则**：{rule.name}（`{rule.code}`）",
+            f"**级别**：{severity}　**触发值**：**{sample.get('value')}**",
+            f"**来源**：{rule.source}　**时间窗**：{window_start:%m-%d %H:%M} ~ {window_end:%H:%M}",
+        ]
+        if labels_line:
+            lines.append(f"**labels**：{labels_line}")
+        buttons = self._buttons(event_id, target.grafana_url)
+        body = build_card(f"[告警] {rule.name}", "red", lines, buttons)
+        await self._post(rule, target.webhook_url, body)
+
+    async def send_recovered(self, rule: Any, sample: dict) -> None:
+        """恢复卡（绿色）：触发序列从上轮到本轮消失（夜莺「恢复通知」对齐）。"""
+        try:
+            target = self._resolve(rule)
+        except RuntimeError as e:
+            logger.error("rule=%s 飞书渠道凭据解析失败: %s", rule.code, e)
+            return
+        metric = sample.get("metric") or {}
+        labels_line = "　".join(f"{k}={v}" for k, v in metric.items())
+        lines = [
+            f"**规则**：{rule.name}（`{rule.code}`）",
+            "**状态**：已恢复 ✓",
+        ]
+        if labels_line:
+            lines.append(f"**labels**：{labels_line}")
+        # 恢复无对应流水事件：仅「查看曲线」按钮，无事件详情
+        buttons = self._buttons(None, target.grafana_url)
+        body = build_card(f"[已恢复] {rule.name}", "green", lines, buttons)
         await self._post(rule, target.webhook_url, body)
 
     async def send_error(self, rule: Any, error: str | None,

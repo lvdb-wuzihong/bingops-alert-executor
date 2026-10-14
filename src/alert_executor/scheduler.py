@@ -27,7 +27,7 @@ from .feishu import FeishuNotifier
 from .lease import RedisLeaseCoordinator, SharedRateLimiter
 from .models import REPORT_ERROR, REPORT_FIRING, STATUS_ERROR, EvaluationResult
 from .reporter import PlatformReporter, current_window
-from .state import Debounce
+from .state import Debounce, SequenceTracker
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +61,8 @@ class AlertExecutor:
         self._evaluators = build_evaluators(self._client, cfg.evaluation)
         self._fetcher = fetcher or AgentConfigFetcher(self._client, cfg.platform)
         self._debounce = Debounce()
+        # 触发序列追踪（PromQL vector）：拆卡 + 部分恢复检测（内存态，重启归零宁漏勿误）
+        self._tracker = SequenceTracker()
         # 共享通知限流：REDIS_URL 有值时跨副本共享窗口；无值/Redis 挂时内部降级本地
         self._gate = SharedRateLimiter(url=os.environ.get("REDIS_URL"))
         # 运行时配置状态：初始为空，由首轮拉取填充（拉不到则空转等待平台）
@@ -198,7 +200,12 @@ class AlertExecutor:
             return
 
         if not result.hit:
-            # 低于阈值静默跳过 = 恢复推导的输入（§0 决策 4），永不报 resolved
+            # 低于阈值/无命中：恢复检测（仅 PromQL vector 有序列身份）+ 防抖清零。
+            # 序列从上轮到本轮消失 → 逐序列发「已恢复」绿卡（部分恢复也能感知）。
+            if isinstance(result.details, list):
+                _, _, recovered = self._tracker.diff(rule.code, [])
+                for sample in recovered.values():
+                    await self._notifier.send_recovered(rule, sample)
             self._debounce.record(rule.code, False, rule.for_rounds)
             return
 
@@ -228,5 +235,17 @@ class AlertExecutor:
                 rule.code, data.get("suppress_reason"),
             )
             return
+        # PromQL vector：按序列拆卡（每条序列独立触发值/生命周期）+ 部分恢复检测
+        if isinstance(result.details, list):
+            added, ongoing, recovered = self._tracker.diff(rule.code,
+                                                           result.details or [])
+            for sample in recovered.values():
+                await self._notifier.send_recovered(rule, sample)
+            # 新增（added）与持续（ongoing）序列都拆卡直发（节奏=评估间隔）
+            for sample in list(added.values()) + list(ongoing.values()):
+                await self._notifier.send_alert_series(
+                    rule, sample, window_start, window_end, event_id=event_id)
+            return
+        # CH 文本：单卡 + details 原样
         await self._notifier.send_alert(rule, result, window_start, window_end,
                                         event_id=event_id)

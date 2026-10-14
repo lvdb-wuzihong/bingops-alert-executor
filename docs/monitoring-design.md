@@ -336,6 +336,13 @@ def resolve_credential(ref: str) -> str | None:
 
 **对齐结论**：显示形态可对齐夜莺卡片约 90%（红色 header/名称/级别/labels 平铺/触发值逐样本/时间/查看曲线均已支撑或小改可支撑）；「屏蔽」为唯一需平台新功能的项，已列入二期清单。
 
+**实现状态（2026-10-14，执行器已落地）**：
+- `_format_details` 显示层格式化：str（CH 文本）原样 / list[dict]（PromQL vector 摘要）逐样本 lark_md 行（`labels 平铺 → **value**`，20 条/800 字符上限）——已实现（feishu.py，事件表 JSONB 保持结构化存储）；
+- 序列拆卡与恢复通知：PromQL vector 按 metric labels 序列身份拆卡（新增/持续序列各一张独立告警卡，触发值加粗）；`SequenceTracker`（执行器内存态）diff 出消失序列 → 逐序列「已恢复」绿卡（部分恢复可感知具体序列；恢复卡无事件详情按钮；重启归零宁漏勿误）——已实现（state.py/scheduler.py），粒度超出本定稿的部分恢复预期；
+- 事件详情按钮：执行器先回报拿响应 `event_id` → 卡片按钮 `{frontend_base_url}/alerts/events/{event_id}`；`NotifyConfig.frontend_base_url` 可选配置——已实现（执行器回报响应 event_id 已透传）；
+- PromQL 数据源 basic auth（username + password_ref，NO_AUTH 匿名）——已实现（评估器 403 修复；另注：当时 403 实因是反代 IP 白名单，双向都需配置）。
+- **待办（前端/平台）**：① bingops-web 需提供 `/alerts/events/{event_id}` 路由（事件详情视图，最低形态为列表页锚点过滤）；② bingops 建议补 `GET /api/v1/alerts/events/{event_id}` 单事件查询接口（列表分页下按 id 定位不可靠）；③ 事件列表接口 status 枚举描述补 `recorded`。
+
 **采纳项（2026-09-10 第二轮评审补充）**：
 - **唯一索引加数据源维度**：`uq_alert_active_firing` 改为 `(source, rule_code, COALESCE(monitoring_source_id, 0))`——修复平台原生规则（source 固定 bingops）跨数据源同名 code 互相吞没的正确性 bug；事件归属取规则绑定的数据源；
 - **error 顺延推导窗口**：评估失败（error 回报）时顺延活跃 firing 的 `last_seen_at`——评估失败=状态未知，保守保持告警，防数据源断连导致的 stale 假恢复风暴（优于「扫描时查 error 子查询」的冻结方案，实现更简）；

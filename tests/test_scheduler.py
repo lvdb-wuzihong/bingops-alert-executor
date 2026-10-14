@@ -44,6 +44,8 @@ class SpyReporter:
 class SpyNotifier:
     def __init__(self) -> None:
         self.alerts: list[tuple[str, int | None]] = []
+        self.series: list[tuple[str, str]] = []     # (rule_code, 触发值)
+        self.recoveries: list[tuple[str, str]] = [] # (rule_code, 恢复序列触发值)
         self.errors: list[str] = []
         self.channel_updates: list[list] = []
 
@@ -52,6 +54,12 @@ class SpyNotifier:
 
     async def send_alert(self, rule, result, ws, we, event_id=None) -> None:
         self.alerts.append((rule.code, event_id))
+
+    async def send_alert_series(self, rule, sample, ws, we, event_id=None) -> None:
+        self.series.append((rule.code, str(sample.get("value"))))
+
+    async def send_recovered(self, rule, sample) -> None:
+        self.recoveries.append((rule.code, str(sample.get("value"))))
 
     async def send_error(self, rule, error, event_id=None) -> None:
         self.errors.append(rule.code)
@@ -236,6 +244,62 @@ async def test_error_goes_both_ways():
     await one_tick(executor)
     assert notifier.errors == ["r1"]            # 飞书 error 卡片
     assert reporter.calls == [("r1", "error")]  # webhook error 回报
+    await executor._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_promql_vector_split_into_series_cards():
+    """PromQL 多序列：每条序列独立一张卡（各自触发值），单份由租约保证。"""
+    vector = EvaluationResult(status=STATUS_OK, hit=True, total_count=2, details=[
+        {"metric": {"instance": "a", "device": "sda"}, "value": "91.2"},
+        {"metric": {"instance": "b", "device": "sdb"}, "value": "88.5"},
+    ])
+    executor, evaluator, reporter, notifier, _ = make_executor(
+        [remote([make_rule()])], {"r1": vector})
+    await one_tick(executor)
+    assert notifier.series == [("r1", "91.2"), ("r1", "88.5")]  # 每序列一张卡
+    assert notifier.alerts == []                                  # 不再合并单卡
+    assert reporter.calls == [("r1", "firing")]                   # 流水回报仍一条
+    await executor._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_series_recovery_card_on_partial_recovery():
+    """部分恢复：消失序列发绿卡，存续序列照常告警卡。"""
+    rule = make_rule()
+    full = EvaluationResult(status=STATUS_OK, hit=True, total_count=2, details=[
+        {"metric": {"instance": "a"}, "value": "91.2"},
+        {"metric": {"instance": "b"}, "value": "88.5"},
+    ])
+    partial = EvaluationResult(status=STATUS_OK, hit=True, total_count=1, details=[
+        {"metric": {"instance": "a"}, "value": "85.0"},
+    ])
+    executor, evaluator, reporter, notifier, _ = make_executor(
+        [remote([rule])], {"r1": full})
+    await one_tick(executor)
+    evaluator.results["r1"] = partial          # 下一轮：b 恢复消失
+    await one_tick(executor)
+    assert notifier.recoveries == [("r1", "88.5")]  # b 序列恢复绿卡
+    # series 时间线：首轮 a+b 各一张；二轮 a 持续照发 + b 恢复绿卡（恢复卡不计入 series）
+    assert notifier.series == [("r1", "91.2"), ("r1", "88.5"), ("r1", "85.0")]
+    await executor._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_all_series_recovered_on_miss():
+    """全部序列恢复（miss）：逐序列发恢复绿卡。"""
+    rule = make_rule()
+    full = EvaluationResult(status=STATUS_OK, hit=True, total_count=1, details=[
+        {"metric": {"instance": "a"}, "value": "91.2"},
+    ])
+    executor, evaluator, reporter, notifier, _ = make_executor(
+        [remote([rule])], {"r1": full})
+    await one_tick(executor)
+    executor._evaluators["clickhouse"].results["r1"] = EvaluationResult(
+        status=STATUS_OK, hit=False, total_count=0, details=[])
+    await one_tick(executor)
+    assert notifier.recoveries == [("r1", "91.2")]  # 全部恢复绿卡
+    assert reporter.calls == [("r1", "firing")]     # miss 不回报（永不报 resolved）
     await executor._client.aclose()
 
 
