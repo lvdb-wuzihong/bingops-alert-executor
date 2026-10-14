@@ -12,7 +12,7 @@
 | 1 | 平台定位 | bingops 只做监控**控制面 + 告警事件闭环层**（无状态）；不存指标采样、不做评估循环、不做查询代理 |
 | 2 | 评估引擎归属 | **夜莺退役（2026-09-09 决策）**，夜莺与 ck-log-alert 均只作实现参考；评估统一由独立执行器（alert-executor）承担——双评估器：clickhouse（SQL 契约）+ victoria/prometheus（PromQL 表达式自带比较，vector 非空即触发）。评估循环不进 bingops 主进程 |
 | 3 | 事件收敛 | 所有来源的告警 → bingops `POST /api/v1/alerts/webhook` 唯一入口；统一事件表，统计才有全局意义 |
-| 4 | resolved 双轨语义 | 夜莺自带恢复事件直传；ck-log-alert **永不报恢复**（低于阈值静默跳过，保持现状），平台按规则级 `stale_minutes` 超时推导 resolved |
+| 4 | resolved 双轨语义（已收敏） | ~~夜莺自带恢复事件直传~~（夜莺 2026-09-21 已下线，该路径成为历史）；指标与日志统一由执行器评估：命中静默跳过 → stale 推导 resolved；`source="n9e"` 枚举保留供历史事件归属 |
 | 5 | 契约豁免 | webhook 为机器对机器接口：裸响应不套 `{"code","message","data"}` 统一信封外的强约束（见 §4.2 折中），不绑用户权限码，`X-Agent-Token` 静态鉴权 + 同 VPC 网络隔离 |
 | 6 | 主旁路纪律 | 执行器回报失败只打日志，**绝不影响飞书通知主路**；平台不可用 = 统计降级，通知不降级 |
 | 7 | details 黑盒 | 事件明细为 JSONB 自由结构，平台不解析内部字段；ck-log-alert 内部实现可整体变动不破契约 |
@@ -219,7 +219,7 @@ error 回报 → 独立落行（status='error'），不进状态机、不开单�
   - 顶层另含日志类汇总：`recorded_total` / `error_total` / `recorded_error_total`（日志告警不进 firing→resolved 闭环，看板卡片需单独口径，与生命周期卡片分开展示）
 - 高频 firing 规则排名即噪声规则治理清单。权限码按 RBAC 规范注册（建议 `alert:read` / `alert:manage`）。
 
-## 10. ck-log-alert 适配清单（约 +30 行）
+## 10. ck-log-alert 适配清单（已作废——ck-log-alert 2026-09 下线，日志告警由 bingops-alert-executor 全面接管，本章仅作迁移历史保留）
 
 | 脚本现有 | payload 字段 | 说明 |
 |---|---|---|
@@ -251,9 +251,9 @@ def report_event(cfg: dict, rule: dict, status: str, total: int,
 
 顺带修复隐患：`interval_minutes` 默认值两处不一致（`build_query` 默认 1 / `run()` 默认 5），统一为一个默认值。
 
-## 11. 夜莺侧接入（迁移过渡期）
+## 11. 夜莺侧接入（已退役，历史记录）
 
-> **演进更新（2026-09-09）：夜莺进入退役计划**。本节仅适用于过渡期：指标规则逐条迁至平台（PromQL 原样贴入 eval_sql，绑 victoria 数据源），执行器接管后夜莺侧同步禁用对应规则，双跑对账；清零后夜莺下线，指标告警由执行器 PromQL 评估器承担（vector 非空即触发）。
+> **2026-09-21：夜莺已下线**。指标规则已全部迁至平台（victoria 数据源 + 执行器 PromQL 评估器），本节仅作为迁移历史保留。`source="n9e"` 枚举与历史事件的 rule_kind='metric' 归属继续有效，仅供存量数据溯源；不再有新的 n9e 来源事件。
 
 通知媒介追加 webhook 指向同一端点（`source: "n9e"`），恢复事件直传 `status: "resolved"`；映射表里为涉及规则配 `group_id`。零代码，纯配置。
 
@@ -323,6 +323,18 @@ def resolve_credential(ref: str) -> str | None:
 - **Webhook 异步化（MQ/Redis Stream 缓冲）**：①「行锁竞争」是误解——部分唯一索引下不同规则的 INSERT 是不同行、完全并行，数千 INSERT/min 对 PG 是轻负载；②致命伤：notify 同步语义（响应体抑制判断）依赖同步处理，异步化会把通知状态逼回执行器，击穿「状态全在平台」设计。风暴场景的正解是渠道级聚合（Top N + 剩余计数），不是 MQ；
 - **一致性哈希分片（worker_id/total_workers）**：HPA 扩缩容时 N 变化 → 规则漂移 → for_rounds 计数失效 → 防抖抖动；动态共识复杂度违背无锁设计。静态归属分片（分片单位=数据源）更简更稳；
 - **防抖状态入 Redis**：计数丢失的后果是漏报几轮（方向安全：告警重启宁漏勿误），非误报；为可容忍代价引入 Redis 依赖不划算。「推给 PromQL FOR 语法」不可实现——FOR 是 rule engine 概念，裸 query 无此语义，必须执行器自维护（即 for_rounds）。
+
+### 飞书卡片渲染契约与夜莺对齐评估（2026-10-14 定稿）
+
+**渲染层格式化职责分离**：评估器产出结构化 details（CH=单行两列文本契约；PromQL=vector 摘要 `[{metric: {labels}, value}]`，条数取规则 detail_limit），事件表 JSONB 保持结构化存储（后续 agent 降噪/分析直接消费）；飞书显示层按形态分派格式化（执行器 `_format_details`）：str 原样（CH），list[dict] 转逐样本 lark_md 行（`key=value … → **value**`，上限 20 条/800 字符截断）。数据与显示分离：事件表永远存结构化，飞书只负责人读。
+
+**触发值语义（与夜莺差异点）**：PromQL 的 `total_count` = 命中**序列条数**（非业务值）；夜莺「触发值 16988」对应的业务数值在各样本的 `value` 里，渲染层逐样本加粗展示。单序列规则的效果等价于夜莺触发值，多序列规则比夜莺多一层「命中了几条序列」的信息。
+
+**事件详情链接**：执行器先回报拿响应 `event_id` → 卡片追加「事件详情」按钮（`{frontend_base_url}/alerts/events/{event_id}`，`frontend_base_url` 进 NotifyConfig 可选配置）；依赖平台前端事件详情视图（前端待补，最低形态为列表页锚点过滤）。
+
+**屏蔽（对应夜莺「屏蔽1小时」）**：`alert_mutes`（labels 匹配 + 时间窗）二期已规划，与「认领/解决」事件处置交互同期实施；短期变通为规则级 `notify_enabled` 关闭。
+
+**对齐结论**：显示形态可对齐夜莺卡片约 90%（红色 header/名称/级别/labels 平铺/触发值逐样本/时间/查看曲线均已支撑或小改可支撑）；「屏蔽」为唯一需平台新功能的项，已列入二期清单。
 
 **采纳项（2026-09-10 第二轮评审补充）**：
 - **唯一索引加数据源维度**：`uq_alert_active_firing` 改为 `(source, rule_code, COALESCE(monitoring_source_id, 0))`——修复平台原生规则（source 固定 bingops）跨数据源同名 code 互相吞没的正确性 bug；事件归属取规则绑定的数据源；

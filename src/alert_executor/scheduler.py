@@ -182,16 +182,17 @@ class AlertExecutor:
         if result.status == STATUS_ERROR:
             # 评估失败 = 状态未知：两路都走（§10）；平台收到 error 回报后
             # 顺延活跃 firing 的 last_seen_at（§12 二轮评审），本侧无需处理。
-            # error 回报无条件发（平台统计/顺延推导窗口需要）；响应携带平台 notify（恒 true）。
+            # error 回报无条件发（平台统计/顺延推导窗口需要）；响应携带 event_id。
             # 橙卡发送节奏由共享限流门控统一控制（ERROR_NOTIFY_MIN_INTERVAL_SECONDS）。
             logger.warning("rule=%s 评估失败: %s", rule.code, result.error)
             data = await self._reporter.report(
                 rule, REPORT_ERROR, 0, window_start, window_end,
                 details=None, error=result.error,
             )
+            event_id = (data or {}).get("event_id")
             if await self._gate.allow(f"error:{rule.code}",
                                       ERROR_NOTIFY_MIN_INTERVAL_SECONDS):
-                await self._notifier.send_error(rule, result.error)
+                await self._notifier.send_error(rule, result.error, event_id=event_id)
             else:
                 logger.info("rule=%s error 卡片共享限流窗口内，仅回报平台", rule.code)
             return
@@ -214,6 +215,8 @@ class AlertExecutor:
             rule, REPORT_FIRING, result.total_count,
             window_start, window_end, result.details,
         )
+        # 回报拿 event_id → 卡片「事件详情」按钮（2026-10-14 渲染契约定稿）
+        event_id = (data or {}).get("event_id")
 
         # 通知与开单解耦（2026-09-11）：notify_enabled 是平台侧工单联动开关，不消费。
         # firing（recorded 流水）每轮直发：Redis 租约已保证单实例评估（单份来源），
@@ -225,4 +228,5 @@ class AlertExecutor:
                 rule.code, data.get("suppress_reason"),
             )
             return
-        await self._notifier.send_alert(rule, result, window_start, window_end)
+        await self._notifier.send_alert(rule, result, window_start, window_end,
+                                        event_id=event_id)

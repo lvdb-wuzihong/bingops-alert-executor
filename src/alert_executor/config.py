@@ -53,6 +53,9 @@ class NotifyConfig(BaseModel):
     default_channel: FeishuBotChannel
     # 卡片跳转兑底（规则未带 grafana_url 时）
     dashboard_url: str | None = None
+    # 平台前端基地址（可选）：执行器回报拿 event_id 后，卡片追加
+    # 「事件详情」按钮 → {frontend_base_url}/alerts/events/{event_id}（2026-10-14 定稿）
+    frontend_base_url: str | None = None
 
 
 class NotifyChannelConfig(BaseModel):

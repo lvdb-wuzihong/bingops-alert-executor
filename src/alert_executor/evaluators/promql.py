@@ -12,6 +12,7 @@ from typing import Any
 
 import httpx
 
+from ..credentials import resolve_credential
 from ..models import STATUS_OK, EvaluationResult
 
 logger = logging.getLogger(__name__)
@@ -34,6 +35,7 @@ class PromQLEvaluator:
         resp = await self._client.get(
             f"{source.normalized_url()}/api/v1/query",
             params={"query": rule.eval_sql},
+            auth=_basic_auth(source),
             timeout=self._timeout,
         )
         resp.raise_for_status()
@@ -48,6 +50,18 @@ class PromQLEvaluator:
             total_count=total,
             details=_summarize(vector, limit=rule.detail_limit),
         )
+
+
+def _basic_auth(source: Any) -> tuple[str, str] | None:
+    """数据源凭据 → httpx basic auth（vmauth/反代鉴权场景）。
+
+    NO_AUTH（无密码）→ None（匿名，不带 Authorization 头）；
+    密码经 password_ref env 解引用（凭据红线），用户名缺省 default。
+    """
+    password = resolve_credential(source.password_ref)
+    if password is None:
+        return None
+    return (source.username or "default", password)
 
 
 def _summarize(vector: list[dict], limit: int) -> list[dict]:

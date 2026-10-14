@@ -7,8 +7,8 @@ import pytest
 import respx
 
 from alert_executor.config import FeishuBotChannel, NotifyChannelConfig, NotifyConfig
-from alert_executor.feishu import (FeishuNotifier, build_card, gen_sign,
-                                   render_template)
+from alert_executor.feishu import (FeishuNotifier, _format_details, build_card,
+                                   gen_sign, render_template)
 from alert_executor.models import EvaluationResult, STATUS_OK
 from conftest import make_rule
 
@@ -17,10 +17,12 @@ HOOK_BOUND = "https://open.feishu.cn/hook/bound"
 
 
 def make_notifier(client: httpx.AsyncClient,
-                  default_secret_ref: str = "DEFAULT_HOOK") -> FeishuNotifier:
+                  default_secret_ref: str = "DEFAULT_HOOK",
+                  frontend_base_url: str | None = None) -> FeishuNotifier:
     return FeishuNotifier(client, NotifyConfig(
         default_channel=FeishuBotChannel(secret_ref=default_secret_ref),
         dashboard_url="https://grafana.example.com",
+        frontend_base_url=frontend_base_url,
     ))
 
 
@@ -39,18 +41,41 @@ def test_gen_sign_deterministic():
     assert gen_sign("secret", 1700000000) != gen_sign("secret", 1700000001)
 
 
-def test_build_card_three_sections():
-    card = build_card("[告警] t", "red", ["line1", "line2"], "https://g.internal")
-    body = card["card"]
-    assert body["header"]["template"] == "red"
-    assert "line1" in body["elements"][0]["text"]["content"]
-    assert body["elements"][1]["tag"] == "hr"
-    assert body["elements"][-1]["actions"][0]["url"] == "https://g.internal"
+def test_build_card_with_buttons():
+    buttons = [{"tag": "button", "text": {"tag": "plain_text", "content": "事件详情"},
+                "type": "default", "url": "https://fe/events/1"}]
+    card = build_card("[告警] t", "red", ["line1"], buttons)
+    action = card["card"]["elements"][-1]
+    assert action["tag"] == "action"
+    assert action["actions"][0]["url"] == "https://fe/events/1"
 
 
-def test_build_card_without_dashboard_has_no_action():
+def test_build_card_without_buttons_has_no_action():
     card = build_card("[告警] t", "red", ["line"])
     assert not any(el["tag"] == "action" for el in card["card"]["elements"])
+
+
+class TestFormatDetails:
+    def test_str_passthrough_clipped(self):
+        assert _format_details("ch-text") == "ch-text"
+
+    def test_vector_samples_as_bold_lines(self):
+        details = [{"metric": {"instance": "n1", "job": "node"}, "value": "91.2"}]
+        out = _format_details(details)
+        assert "instance=n1 job=node → **91.2**" in out
+
+    def test_sample_limit_20_and_truncation_note(self):
+        details = [{"metric": {"i": str(i)}, "value": str(i)} for i in range(25)]
+        out = _format_details(details)
+        assert out.count("**") == 40  # 20 行 × 2 个 **
+        assert "其余 5 条序列略" in out
+
+    def test_800_char_clip(self):
+        details = [{"metric": {"pad": "x" * 100}, "value": "v"} for _ in range(20)]
+        assert len(_format_details(details)) <= 808  # 800 + 截断标记余量
+
+    def test_none_is_empty(self):
+        assert _format_details(None) == ""
 
 
 class TestChannelResolution:
@@ -124,6 +149,25 @@ class TestChannelResolution:
         async with httpx.AsyncClient() as client:
             await make_notifier(client).send_alert(make_rule(), hit_result(),
                                                    _fake_dt(), _fake_dt())
+
+    @respx.mock
+    async def test_event_detail_button_and_vector_trigger_values(self, monkeypatch):
+        """夜莺对齐：回报拿 event_id → 事件详情按钮；vector 逐样本触发值加粗。"""
+        monkeypatch.setenv("DEFAULT_HOOK", HOOK_DEFAULT)
+        route = respx.post(HOOK_DEFAULT).respond(json={"code": 0})
+        rule = make_rule(grafana_url=None)             # 仅事件详情按钮（无看板链接）
+        result = EvaluationResult(status=STATUS_OK, hit=True, total_count=1,
+                                  details=[{"metric": {"instance": "n1"},
+                                            "value": "91.2"}])
+        async with httpx.AsyncClient() as client:
+            notifier = make_notifier(client,
+                                     frontend_base_url="https://bingops.example.com/")
+            await notifier.send_alert(rule, result, _fake_dt(), _fake_dt(),
+                                      event_id=42)
+        sent = route.calls[0].request.content.decode()
+        assert "https://bingops.example.com/alerts/events/42" in sent  # 事件详情按钮
+        assert "instance=n1 → **91.2**" in sent                        # 夜莺触发值逐样本
+        assert "查看曲线" in sent                                      # dashboard_url 兜底按钮共存
 
 
 class TestCardTemplate:

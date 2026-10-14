@@ -18,7 +18,9 @@ notify:
   default_channel:
     type: feishu-bot
     secret_ref: FEISHU_WEBHOOK_URL        # env 值 = 完整 webhook 地址
-  dashboard_url: https://grafana.example.com   # 卡片跳转兜底（规则未带 grafana_url 时）
+  dashboard_url: https://grafana.example.com   # 卡片跳转兑底（规则未带 grafana_url 时）
+  frontend_base_url: https://bingops.example.com   # 可选：平台前端基地址，卡片追加「事件详情」按钮
+    # → {frontend_base_url}/alerts/events/{event_id}（event_id 来自回报响应）
 
 evaluation:
   timeout_seconds: 10                     # 单条评估硬超时

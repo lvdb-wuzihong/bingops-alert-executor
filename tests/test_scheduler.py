@@ -27,10 +27,13 @@ class FakeEvaluator:
         return self.results[rule.code]
 
 
+_DEFAULT_RESPONSE: dict = {"notify": True, "event_id": 1}
+
+
 class SpyReporter:
-    def __init__(self, response: dict | None = None) -> None:
-        # response=None 模拟回报失败（data=None → 主旁路默认发飞书）
-        self.response = {"notify": True, "event_id": 1} if response is None else response
+    def __init__(self, response: dict | None | object = _DEFAULT_RESPONSE) -> None:
+        # 显式传 None = 模拟回报失败（report 返回 None → data=None → 主旁路默认发飞书）
+        self.response = response
         self.calls: list[tuple[str, str]] = []
 
     async def report(self, rule, status, total, ws, we, details, error=None):
@@ -40,17 +43,17 @@ class SpyReporter:
 
 class SpyNotifier:
     def __init__(self) -> None:
-        self.alerts: list[str] = []
+        self.alerts: list[tuple[str, int | None]] = []
         self.errors: list[str] = []
         self.channel_updates: list[list] = []
 
     def update_channels(self, channels) -> None:
         self.channel_updates.append(list(channels))
 
-    async def send_alert(self, rule, result, ws, we) -> None:
-        self.alerts.append(rule.code)
+    async def send_alert(self, rule, result, ws, we, event_id=None) -> None:
+        self.alerts.append((rule.code, event_id))
 
-    async def send_error(self, rule, error) -> None:
+    async def send_error(self, rule, error, event_id=None) -> None:
         self.errors.append(rule.code)
 
 
@@ -156,7 +159,7 @@ async def test_notify_enabled_decoupled_from_notification():
     executor, evaluator, reporter, notifier, _ = make_executor(
         [remote([make_rule(notify_enabled=False)])], {"r1": HIT})
     await one_tick(executor)
-    assert notifier.alerts == ["r1"]                 # 通知照发（依据=渠道绑定，与开单解耦）
+    assert notifier.alerts == [("r1", None)]                 # 通知照发（依据=渠道绑定，与开单解耦）
     assert reporter.calls == [("r1", "firing")]
     await executor._client.aclose()
 
@@ -180,7 +183,7 @@ async def test_report_failure_defaults_to_feishu():
         [remote([make_rule()])], {"r1": HIT}, reporter_response=None)
     await one_tick(executor)
     assert reporter.calls == [("r1", "firing")]
-    assert notifier.alerts == ["r1"]
+    assert notifier.alerts == [("r1", None)]
     await executor._client.aclose()
 
 
@@ -245,7 +248,7 @@ async def test_for_rounds_debounce_gate():
     assert reporter.calls == []                  # 前两轮被防抖拦下
     await one_tick(executor)
     assert reporter.calls == [("r1", "firing")]  # 第三轮连续达标放行
-    assert notifier.alerts == ["r1"]
+    assert notifier.alerts == [("r1", None)]
     await executor._client.aclose()
 
 
@@ -257,7 +260,7 @@ async def test_firing_streams_every_round_without_gate():
     await one_tick(executor)
     await one_tick(executor)
     assert reporter.calls == [("r1", "firing"), ("r1", "firing")]  # webhook 照报
-    assert notifier.alerts == ["r1", "r1"]                         # 飞书每轮直发
+    assert notifier.alerts == [("r1", None), ("r1", None)]                         # 飞书每轮直发
     await executor._client.aclose()
 
 

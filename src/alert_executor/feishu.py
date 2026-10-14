@@ -2,7 +2,9 @@
 
 渠道语义（平台「通知渠道」契约）：平台只下发 ``secret_ref`` 引用名，真实 webhook
 地址在执行器侧 env（URL 即 secret）；规则绑定渠道缺失/禁用时回退默认渠道（宁多勿漏）。
-卡片：规则带 ``card_template``（JSON 模板）时执行器自行渲染发送，否则用内置三段式卡片。
+卡片：规则带 ``card_template``（JSON 模板）时执行器自行渲染发送，否则用内置夜莺对齐卡片
+（红色 header/名称/级别/labels 平铺/触发值逐样本/时间/事件详情与查看曲线按钮，
+渲染契约见设计文档 §「飞书卡片渲染契约与夜莺对齐评估 2026-10-14 定稿」）。
 """
 
 from __future__ import annotations
@@ -25,14 +27,10 @@ logger = logging.getLogger(__name__)
 
 # details 摘要进卡片的最大字符数，防止长文本刷爆卡片
 MAX_DETAILS_CHARS = 800
+# 显示层逐样本上限（渲染契约定稿：上限 20 条；摘要条数另由规则 detail_limit 控制）
+MAX_SAMPLES_IN_CARD = 20
 
 _SEVERITY_LABELS = {1: "严重", 2: "中等", 3: "轻微"}
-
-# 模板占位符（card_template 字符串值内替换）
-_TEMPLATE_VARS = (
-    "rule_code", "rule_name", "source", "severity", "total_count",
-    "window_start", "window_end", "details_text",
-)
 
 
 def gen_sign(secret: str, timestamp: int) -> str:
@@ -43,8 +41,8 @@ def gen_sign(secret: str, timestamp: int) -> str:
 
 
 def build_card(title: str, template: str, md_lines: list[str],
-               dashboard_url: str | None = None) -> dict:
-    """三段式卡片：header + 明细（lark_md）+ 跳转按钮。"""
+               buttons: list[dict] | None = None) -> dict:
+    """三段式卡片：header + 明细（lark_md）+ 底部按钮组（事件详情/查看曲线等）。"""
     elements: list[dict] = [
         {"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(md_lines)}},
         {"tag": "hr"},
@@ -52,16 +50,8 @@ def build_card(title: str, template: str, md_lines: list[str],
             {"tag": "plain_text", "content": "bingops alert-executor"},
         ]},
     ]
-    if dashboard_url:
-        elements.append({
-            "tag": "action",
-            "actions": [{
-                "tag": "button",
-                "text": {"tag": "plain_text", "content": "前往看板"},
-                "type": "primary",
-                "url": dashboard_url,
-            }],
-        })
+    if buttons:
+        elements.append({"tag": "action", "actions": buttons})
     return {
         "msg_type": "interactive",
         "card": {
@@ -72,6 +62,42 @@ def build_card(title: str, template: str, md_lines: list[str],
             "elements": elements,
         },
     }
+
+
+def _button(text: str, url: str, button_type: str = "default") -> dict:
+    return {"tag": "button", "text": {"tag": "plain_text", "content": text},
+            "type": button_type, "url": url}
+
+
+def _format_details(details: Any) -> str:
+    """飞书显示层格式化（2026-10-14 定稿：数据与显示分离，事件表存结构化、飞书负责人读）。
+
+    - str（CH 单行两列文本契约）→ 原样（截断）；
+    - list[dict]（PromQL vector 摘要 [{metric, value}]）→ 逐样本 lark_md 行：
+      ``labels 平铺 → **value**``（夜莺「触发值」对齐：业务数值加粗，
+      单序列规则效果等价夜莺触发值，多序列多一层「命中了几条序列」信息），
+      上限 20 条（超出部分计数省略），输出整体 800 字符截断；
+    - 其他 → str（截断）。
+    """
+    if details is None:
+        return ""
+    if isinstance(details, str):
+        return _clip(details)
+    if isinstance(details, list):
+        lines: list[str] = []
+        for item in details[:MAX_SAMPLES_IN_CARD]:
+            if isinstance(item, dict):
+                metric = item.get("metric") or {}
+                labels = " ".join(f"{k}={v}" for k, v in metric.items())
+                arrow = f"{labels} → " if labels else ""
+                lines.append(f"{arrow}**{item.get('value')}**")
+            else:
+                lines.append(_clip(item, 200))
+        text = "\n".join(lines)
+        if len(details) > MAX_SAMPLES_IN_CARD:
+            text += f"\n…（其余 {len(details) - MAX_SAMPLES_IN_CARD} 条序列略）"
+        return _clip(text)
+    return _clip(str(details))
 
 
 def render_template(card_template: dict, rule: Any, result: Any,
@@ -85,7 +111,7 @@ def render_template(card_template: dict, rule: Any, result: Any,
         "total_count": str(result.total_count),
         "window_start": f"{window_start:%Y-%m-%d %H:%M:%S}",
         "window_end": f"{window_end:%Y-%m-%d %H:%M:%S}",
-        "details_text": _clip(result.details),
+        "details_text": _format_details(result.details),
     }
 
     def walk(value: Any) -> Any:
@@ -138,9 +164,26 @@ class FeishuNotifier:
         return _Target(webhook_url=webhook_url, grafana_url=grafana_url,
                        card_template=rule.card_template)
 
+    def _buttons(self, event_id: int | None, grafana_url: str | None) -> list[dict]:
+        """卡片按钮组：事件详情（平台前端）+ 查看曲线（Grafana/看板），按配置有无生成。"""
+        buttons: list[dict] = []
+        frontend = self._cfg.frontend_base_url
+        if event_id and frontend:
+            buttons.append(_button(
+                "事件详情", f"{str(frontend).rstrip('/')}/alerts/events/{event_id}"))
+        if grafana_url:
+            buttons.append(_button("查看曲线", grafana_url, button_type="primary"))
+        return buttons
+
+    def _labels_line(self, rule: Any) -> str:
+        """labels 平铺（static_labels 补齐 + 规则自带优先，与回报 payload 同口径）。"""
+        merged = {**rule.static_labels, **rule.labels}
+        return "　".join(f"{k}={v}" for k, v in merged.items())
+
     async def send_alert(self, rule: Any, result: Any,
-                         window_start: datetime, window_end: datetime) -> None:
-        """firing 告警：优先规则卡片模板，否则内置红色三段式卡片。"""
+                         window_start: datetime, window_end: datetime,
+                         event_id: int | None = None) -> None:
+        """firing 告警：优先规则卡片模板，否则内置夜莺对齐红色卡片。"""
         try:
             target = self._resolve(rule)
         except RuntimeError as e:  # 凭据 env 缺失（fail fast 语义）
@@ -153,15 +196,19 @@ class FeishuNotifier:
             severity = _SEVERITY_LABELS.get(rule.severity, str(rule.severity))
             lines = [
                 f"**规则**：{rule.name}（`{rule.code}`）",
-                f"**级别**：{severity}　**触发数**：{result.total_count}",
+                f"**级别**：{severity}　**命中序列**：{result.total_count}",
                 f"**来源**：{rule.source}　**时间窗**：{window_start:%m-%d %H:%M} ~ {window_end:%H:%M}",
-                "",
-                f"{_clip(result.details)}",
             ]
-            body = build_card(f"[告警] {rule.name}", "red", lines, target.grafana_url)
+            labels_line = self._labels_line(rule)
+            if labels_line:
+                lines.append(f"**labels**：{labels_line}")
+            lines += ["", _format_details(result.details)]
+            buttons = self._buttons(event_id, target.grafana_url)
+            body = build_card(f"[告警] {rule.name}", "red", lines, buttons)
         await self._post(rule, target.webhook_url, body)
 
-    async def send_error(self, rule: Any, error: str | None) -> None:
+    async def send_error(self, rule: Any, error: str | None,
+                         event_id: int | None = None) -> None:
         """评估失败卡片（橙色）：两路都走（§10），不发飞书的旧改动不要。"""
         try:
             target = self._resolve(rule)
@@ -174,7 +221,8 @@ class FeishuNotifier:
             "",
             f"```\n{_clip(error, 500)}\n```",
         ]
-        body = build_card(f"[评估失败] {rule.name}", "orange", lines, target.grafana_url)
+        buttons = self._buttons(event_id, target.grafana_url)
+        body = build_card(f"[评估失败] {rule.name}", "orange", lines, buttons)
         await self._post(rule, target.webhook_url, body)
 
     async def _post(self, rule: Any, webhook_url: str, body: dict) -> None:
@@ -209,4 +257,5 @@ def _clip(value: Any, limit: int = MAX_DETAILS_CHARS) -> str:
     return text if len(text) <= limit else text[:limit] + "…(截断)"
 
 
-__all__ = ["FeishuNotifier", "build_card", "gen_sign", "render_template"]
+__all__ = ["FeishuNotifier", "build_card", "gen_sign", "render_template",
+           "_format_details"]

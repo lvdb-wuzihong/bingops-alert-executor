@@ -93,6 +93,30 @@ class TestPromQLEvaluator:
         assert result.hit is False
 
     @respx.mock
+    async def test_basic_auth_sent_when_credentials_configured(self, monkeypatch):
+        """vmauth/反代鉴权场景：username+password_ref → Basic Authorization 头。"""
+        monkeypatch.setenv("VM_PASSWORD", "s3cret")
+        route = respx.get("http://vm.internal:8428/api/v1/query").respond(
+            json={"status": "success", "data": {"result": []}}
+        )
+        source = make_source(type_="victoria", username="vmreader",
+                             password_ref="VM_PASSWORD")
+        async with httpx.AsyncClient() as client:
+            await PromQLEvaluator(client, 10).evaluate(make_rule(), source)
+        auth_header = route.calls[0].request.headers.get("Authorization", "")
+        assert auth_header.startswith("Basic ")
+
+    @respx.mock
+    async def test_no_auth_sends_no_authorization_header(self):
+        route = respx.get("http://vm.internal:8428/api/v1/query").respond(
+            json={"status": "success", "data": {"result": []}}
+        )
+        async with httpx.AsyncClient() as client:
+            await PromQLEvaluator(client, 10).evaluate(
+                make_rule(), make_source(type_="victoria"))  # password_ref=NO_AUTH
+        assert "Authorization" not in route.calls[0].request.headers
+
+    @respx.mock
     async def test_query_error_becomes_error(self):
         respx.get("http://vm.internal:8428/api/v1/query").respond(status_code=502)
         async with httpx.AsyncClient() as client:
