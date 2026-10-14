@@ -112,10 +112,10 @@ sql/migrations/v21_alert_events.sql
 ### 4.2 响应体
 
 ```json
-{"code": 0, "message": "ok", "data": {"event_id": 123, "notify": true, "suppress_reason": null, "repeat_after_minutes": 30}}
+{"code": 0, "message": "ok", "data": {"event_id": 123, "notify": true, "suppress_reason": null, "repeat_after_minutes": 1}}
 ```
 
-`notify` 语义：`false` = 同一活跃 firing 本平台已处理过，执行器可跳过本轮飞书通知；**回报失败 / 超时 / 响应不可解析时执行器默认发**——主路自动退化为现状行为，宁多勿漏。一期执行器可不读该字段（行为不变），二期模块化时转正。
+`notify` 语义：`false` = 本轮通知被平台抑制，执行器跳过飞书发送；**回报失败 / 超时 / 响应不可解析时执行器默认发**——主路自动退化为现状行为，宁多勿漏。抑制来源两类：① repeat 窗口内（活跃 firing 已提醒过，防短时重复）；② 屏蔽命中（§12 alert_mutes，变更窗口等场景静音）。`suppress_reason` 为人读字符串（如 `"muted:{屏蔽规则名}"` / `"firing ongoing"`），执行器仅用于日志，不做逻辑分支。执行器消费现状：firing（metric 拆卡）/ recorded（log 流水）路径已消费（`notify=false` 跳过）；error 橙卡路径待补消费（见 §12 屏蔽对接分工）。
 
 `repeat_after_minutes`：夜莺 repeat notify 同款——活跃 firing 持续期间，距上次通知超过该间隔时响应 `notify:true` 重发提醒（防遗忘），未超时返回 `notify:false`。一期协议预留，执行器可选读。
 
@@ -332,9 +332,42 @@ def resolve_credential(ref: str) -> str | None:
 
 **事件详情链接**：执行器先回报拿响应 `event_id` → 卡片追加「事件详情」按钮（`{frontend_base_url}/alerts/events/{event_id}`，`frontend_base_url` 进 NotifyConfig 可选配置）；依赖平台前端事件详情视图（前端待补，最低形态为列表页锚点过滤）。
 
-**屏蔽（对应夜莺「屏蔽1小时」）**：`alert_mutes`（labels 匹配 + 时间窗）二期已规划，与「认领/解决」事件处置交互同期实施；短期变通为规则级 `notify_enabled` 关闭。
+**屏蔽（对应夜莺「屏蔽1小时」）——平台已实施（2026-10-14，v27）**：`alert_mutes` 表（name / rule_code〔空=全部规则〕/ labels 匹配器〔JSONB <@，空=不过滤〕/ starts_at ~ ends_at / note / enabled / created_by）。生效点在平台 webhook 链路 notify 计算处（仅 notify=true 的返回点前检查，已是 false 的路径不浪费查询）：事件**照常落库**（事实保留可回溯），命中则 `notify=false, suppress_reason="muted:{name}"`；metric 新建 firing 时屏蔽命中同时跳过开单联动。管理端 `/api/v1/alerts/mutes` CRUD + `alert_mute:*` 权限码。与变更封禁窗口自动联动为后续增强。
 
-**对齐结论**：显示形态可对齐夜莺卡片约 90%（红色 header/名称/级别/labels 平铺/触发值逐样本/时间/查看曲线均已支撑或小改可支撑）；「屏蔽」为唯一需平台新功能的项，已列入二期清单。
+屏蔽对接分工（2026-10-14 定稿，待执行器/前端各领）：
+
+**执行器待办（1 处）**：error 橙卡路径（scheduler.py `_evaluate` 失败分支）当前只读执行器侧共享限流门控、不消费响应 `notify`——mute 对 error 卡无效。补丁（`_gate.allow` 判断前加，与 firing 路径同款）：
+
+```python
+if data is not None and data.get("notify") is False:
+    logger.info(
+        "rule=%s 平台通知抑制（%s），跳过 error 卡",
+        rule.code, data.get("suppress_reason"),
+    )
+    return
+```
+
+firing（metric 拆卡）/ recorded（log 流水）路径已天然生效（`data.get("notify") is False` 分支现成），零改动；部分恢复绿卡（`send_recovered`，不经 webhook 回报）不受 mute 控制——恢复是单次好消息，刻意不屏蔽。
+
+**前端对接清单（屏蔽管理页）**：
+
+| 端点 | 权限码 | 说明 |
+|---|---|---|
+| `GET /api/v1/alerts/mutes` | `alert_mute:list` | 列表（含已过期，便于回看历史） |
+| `POST /api/v1/alerts/mutes` | `alert_mute:create` | 创建（created_by 自动记录当前用户） |
+| `PUT /api/v1/alerts/mutes/{mute_id}` | `alert_mute:update` | 部分更新（时间窗单端提供时与旧值合并后校验） |
+| `DELETE /api/v1/alerts/mutes/{mute_id}` | `alert_mute:delete` | 删除 |
+
+表单字段（AlertMuteCreate，7 字段）：`name`（必填，≤64）、`rule_code`（可空 = 屏蔽全部规则；非空精确匹配规则 code）、`labels`（键值对匹配器，空 = 不过滤标签）、`starts_at` / `ends_at`（ISO 8601，ends_at 须晚于 starts_at，后端校验）、`note`（≤512，建议写变更单号）、`enabled`。交互建议：rule_code 用规则下拉（数据源 `GET /api/v1/alerts/rules`）；labels 用键值对编辑器；时间窗用日期时间选择器；列表页加「生效中 / 未开始 / 已过期」状态徽标（前端按 now 与时间窗比较）与 enabled 快捷开关。
+
+**屏蔽入口与鉴权纪律（2026-10-14 补定）**：
+
+- **前端：事件详情页/列表行内加「屏蔽」按钮（推荐）**——点击弹预填 mute 表单：`rule_code` 取当前事件、`labels` 预填事件关键标签（env/app 等，用户可删减）、时间窗快捷选项（1h / 4h / 今日内）、`note` 预填来源事件编号；提交走标准 `POST /api/v1/alerts/mutes`（鉴权）；
+- **执行器：不加屏蔽按钮**——飞书 webhook 机器人卡片按钮仅限 url 跳转（收不了回调），屏蔽动作收敛在平台页面（卡片已有「事件详情」按钮可达）；可选增强：事件详情链接追加 `?action=mute`，前端识别后自动展开屏蔽表单（拼参一行改动，非必须）；
+- **鉴权：屏蔽管理必须走标准 JWT + `alert_mute:*` 权限码（已实现），不豁免**——屏蔽是「让告警闭嘴」的操作，误操作/越权屏蔽 = 故障静默，属运维高危动作（与 webhook/agent 的 X-Agent-Token 机器对机器鉴权是两套体系，互不替代）；值班便捷性的正确解法是**角色授权放宽**（把 `alert_mute:create` 授予 operator 角色），而不是绕过鉴权；
+- **访问链路与权限渲染**：卡片「事件详情」→ 浏览器打开详情页（未登录走飞书 SSO 后回跳原页）→「屏蔽」按钮按权限码 `alert_mute:create` 渲染（无权限隐藏/置灰），后端 `require_permission` 403 兜底（绕过前端直调 API 也会被拒）。角色默认分配按 init_data 规则：operator 应获得 `alert_mute:*` 全部（值班可屏蔽），viewer/auditor 仅 `alert_mute:list`（只读可看不可建）；**生产库 role_permissions 表非空时 init_data 不补绑新权限码**——需在角色管理界面（或 SQL）手工把 `alert_mute:*` 授予 operator，否则 operator 也点不了。
+
+**对齐结论**：显示形态可对齐夜莺卡片约 90%（红色 header/名称/级别/labels 平铺/触发值逐样本/时间/查看曲线均已支撑或小改可支撑）；「屏蔽」为其中唯一需平台新功能的项，已实施（v27）。
 
 **实现状态（2026-10-14，执行器已落地）**：
 - `_format_details` 显示层格式化：str（CH 文本）原样 / list[dict]（PromQL vector 摘要）逐样本 lark_md 行（`labels 平铺 → **value**`，20 条/800 字符上限）——已实现（feishu.py，事件表 JSONB 保持结构化存储）；
@@ -371,7 +404,7 @@ def resolve_credential(ref: str) -> str | None:
 | AlertRule.for_duration 防抖 / pending | 规则 `for_rounds`（连续 M 轮达标才报 firing），执行器侧实现，平台无 pending 态 | 执行器侧，二期字段化 |
 | severity 1/2/3 | payload 可选 + alert_events.severity + 工单优先级映射 | 一期 |
 | repeat notify | 响应体 `repeat_after_minutes` 活跃 firing 重发提醒 | 一期协议预留 |
-| AlertMute 屏蔽 | `alert_mutes`（labels 匹配 + 时间窗），与变更封禁窗口联动 | 二期 |
+| AlertMute 屏蔽 | `alert_mutes`（labels 匹配 + 时间窗），与变更封禁窗口联动 | **已实施（v27）** |
 | v8 告警规则/通知规则分离 | alert_rules 检测字段与通知字段分组演进 | 二期表结构 |
 | WatchAlert escalation | firing 持续未响应升级通知 | 二期候选 |
 | Cur/HisEvent 分表 | 单表 + status + `uq_active_firing` 部分索引（等价更简） | 不搬 |

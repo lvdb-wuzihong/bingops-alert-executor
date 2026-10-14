@@ -192,6 +192,14 @@ class AlertExecutor:
                 details=None, error=result.error,
             )
             event_id = (data or {}).get("event_id")
+            # mute 屏蔽消费（2026-10-14 定稿）：平台命中 alert_mutes 时 notify=false
+            # （suppress_reason="muted:{name}"），error 卡跳过——事件照常落库，仅通知闭嘴。
+            if data is not None and data.get("notify") is False:
+                logger.info(
+                    "rule=%s 平台通知抑制（%s），跳过 error 卡",
+                    rule.code, data.get("suppress_reason"),
+                )
+                return
             if await self._gate.allow(f"error:{rule.code}",
                                       ERROR_NOTIFY_MIN_INTERVAL_SECONDS):
                 await self._notifier.send_error(rule, result.error, event_id=event_id)

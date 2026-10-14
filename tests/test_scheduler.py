@@ -211,6 +211,21 @@ async def test_error_card_rate_limited_on_repeated_failures():
 
 
 @pytest.mark.asyncio
+async def test_error_card_muted_by_platform_suppressed():
+    """mute 屏蔽（平台 alert_mutes）：error 回报 notify=false → 橙卡跳过，事件照常落库。"""
+    rule = make_rule()
+    err = EvaluationResult.from_error(RuntimeError("ch down"))
+    executor, evaluator, reporter, notifier, _ = make_executor(
+        [remote([rule])], {"r1": err},
+        reporter_response={"notify": False,
+                           "suppress_reason": "muted:maintenance-window"})
+    await one_tick(executor)
+    assert notifier.errors == []                            # 橙卡被屏蔽
+    assert reporter.calls == [("r1", "error")]               # 事件照常落库
+    await executor._client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_error_card_gate_controls_rate():
     """error 橙卡由共享门控节流（平台 notify 已回退为恒 true，去重归执行器门控）。"""
     rule = make_rule()
