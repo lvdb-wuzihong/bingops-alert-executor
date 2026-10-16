@@ -44,6 +44,16 @@ ERROR_NOTIFY_MIN_INTERVAL_SECONDS = float(
     os.environ.get("ALERT_EXECUTOR_ERROR_NOTIFY_INTERVAL_SECONDS", "60"),
 )
 
+# ── HTTP 连接池（2026-10-16 跨境链路调优） ─────────────────────────────────────
+# httpx 默认 keepalive_expiry=5s：评估间隔 60s 下连接每轮必过期，每轮每条规则都重付
+# DNS+TCP 握手——跨境抖动（DNS 慢/丢包重传）遂被放大成评估墙钟超时。延长空闲保留
+# 让连接跨轮复用；配套：PromQL 评估器对连接级错误重试一次（陈旧连接被对端关闭自愈）。
+_HTTP_LIMITS = httpx.Limits(
+    max_connections=64,
+    max_keepalive_connections=32,
+    keepalive_expiry=240.0,   # ≥ 数倍评估间隔；空闲超过 240s 才丢弃
+)
+
 # ── 多副本协调（2026-09-13 用户决策：Redis 租约，见 lease.py） ──────────────────
 # REDIS_URL 注入即启用：每条规则同一时刻恰好一个实例评估（Deployment 任意扩缩容）；
 # 未注入 → 全量评估（单副本兼容）；Redis 不可用 → fail-open（宁多勿漏，平台兜底）。
@@ -54,7 +64,9 @@ class AlertExecutor:
                  fetcher: AgentConfigFetcher | None = None,
                  coordinator: RedisLeaseCoordinator | None = None) -> None:
         self._cfg = cfg
-        self._client = client or httpx.AsyncClient(follow_redirects=True)
+        self._client = client or httpx.AsyncClient(
+            follow_redirects=True, limits=_HTTP_LIMITS,
+        )
         self._owns_client = client is None
         self._reporter = PlatformReporter(self._client, cfg.platform)
         self._notifier = FeishuNotifier(self._client, cfg.notify)

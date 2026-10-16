@@ -135,3 +135,31 @@ class TestPromQLEvaluator:
             result = await PromQLEvaluator(client, 10).evaluate(
                 make_rule(detail_limit=5), make_source(type_="victoria"))
         assert len(result.details) == 5
+
+    @respx.mock
+    async def test_retry_once_on_connection_level_failure(self):
+        """连接级瞬时故障（陈旧 keepalive/跨境抖动）：GET 幂等，重试一次自愈。"""
+        route = respx.get("http://vm.internal:8428/api/v1/query")
+        route.side_effect = [
+            httpx.RemoteProtocolError("server disconnected"),
+            httpx.Response(200, json={"status": "success", "data": {"result": [
+                {"metric": {"instance": "n1"}, "value": [0, "1"]},
+            ]}}),
+        ]
+        async with httpx.AsyncClient() as client:
+            result = await PromQLEvaluator(client, 10).evaluate(
+                make_rule(), make_source(type_="victoria"))
+        assert result.status == "ok"
+        assert result.hit is True
+        assert route.call_count == 2
+
+    @respx.mock
+    async def test_retry_exhausted_returns_error(self):
+        """重试一次仍失败 → error（两路都走，不无限重试）。"""
+        route = respx.get("http://vm.internal:8428/api/v1/query")
+        route.side_effect = httpx.ConnectError("refused")
+        async with httpx.AsyncClient() as client:
+            result = await PromQLEvaluator(client, 10).evaluate(
+                make_rule(), make_source(type_="victoria"))
+        assert result.status == "error"
+        assert route.call_count == 2
